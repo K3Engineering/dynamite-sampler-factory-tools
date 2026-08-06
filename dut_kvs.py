@@ -24,9 +24,23 @@ import bleak
 
 # The python-api folder is a sibling of this project and uses flat imports.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python-api"))
+import dynamite_sampler_api as ds  # noqa: E402
 from dynamite_sampler_bleak_util import find_dynamite_samplers  # noqa: E402
 
 KVS_CHR_UUID = "10adce11-68a6-450b-9810-ca11b39fd283"
+
+
+class HardwareRevision(ds.BLECharacteristicRead[str]):
+    """DIS Hardware Revision String (0x2A27): the board model, e.g. 'v700P'.
+
+    Compiled into the firmware (boardConfig.name in board_cfg.h)."""
+
+    UUID = "2A27"
+
+    @staticmethod
+    def unpack(b: bytearray | bytes) -> str:
+        # Firmware publishes the fixed-size char array, null padding included.
+        return bytes(b).rstrip(b"\x00").decode()
 
 FOLDER_FACTORY = "F"
 FOLDER_USER = "U"

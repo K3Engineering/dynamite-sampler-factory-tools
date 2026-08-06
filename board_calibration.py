@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dut_kvs import FOLDER_FACTORY, DutKvs, KvsError
-from factory_data import BOARD_MODELS
+from nominal_values import BOARD_MODELS
 
 # For DeviceInfo reads via the python-api (dut_kvs put it on sys.path).
 import dynamite_sampler_api as ds
