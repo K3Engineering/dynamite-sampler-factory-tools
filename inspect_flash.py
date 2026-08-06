@@ -1,8 +1,9 @@
-"""Factory script 3 of 4: inspect flash contents (read-only).
+"""Inspect flash contents
 
 Dumps the Factory, User and Settings KVS namespaces over BLE and prints
-them. Pretty-prints by default; --raw emits JSON for scripting. Never
-modifies the device. For targeted edits use edit_flash.py.
+them. Pretty-prints by default; --raw emits JSON for scripting.
+
+Never modifies the device. For targeted edits use edit_flash.py.
 
 Usage:
     python inspect_flash.py [--address AA:BB:CC:DD:EE:FF] [--folder F [--folder U]] [--raw]
@@ -50,7 +51,9 @@ async def dump_namespace(dut: DutKvs, folder: str) -> dict[str, str]:
     return out
 
 
-def print_pretty(device: dict, data: dict[str, dict[str, str]], folders: list[str]) -> None:
+def print_pretty(
+    device: dict, data: dict[str, dict[str, str]], folders: list[str]
+) -> None:
     print(
         f"Device: {device['address']} ({device['name']})"
         f"  board {device['board_model']}  fw {device['firmware_rev']}"
@@ -74,7 +77,9 @@ async def inspect(args: argparse.Namespace) -> int:
             "address": dut.client.address,
             "name": dut.device_name,
             "board_model": await read_characteristic(dut.client, HardwareRevision),
-            "firmware_rev": await read_characteristic(dut.client, ds.DeviceInfo.FirmwareRevision),
+            "firmware_rev": await read_characteristic(
+                dut.client, ds.DeviceInfo.FirmwareRevision
+            ),
         }
         data = {folder: await dump_namespace(dut, folder) for folder in folders}
 
@@ -105,7 +110,9 @@ def main() -> None:
         type=folder_type,
         help="namespace to dump: F, U or S (default: all three; repeatable)",
     )
-    parser.add_argument("--raw", action="store_true", help="emit JSON instead of pretty print")
+    parser.add_argument(
+        "--raw", action="store_true", help="emit JSON instead of pretty print"
+    )
     args = parser.parse_args()
 
     try:

@@ -1,4 +1,4 @@
-"""Factory script 4 of 4: targeted edits to flash contents (dev tool).
+"""Targeted edits to flash contents (dev tool).
 
 Get/set/delete individual keys, or clear a whole namespace, in any of the
 KVS folders (Factory, User, Settings). For read-only dumps use

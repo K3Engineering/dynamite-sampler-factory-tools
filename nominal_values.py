@@ -1,9 +1,8 @@
 """Board-model lookup and Factory-namespace data layout for the factory scripts.
 
-Values mirror flash_factory_nvs.py (firmware branch flash_board_model).
-Scalar values carry a provenance tag: "<value>,<provenance>". Everything
-written by flash_factory_nominals.py is "nominal" (model-derived, not
-measured); calibration overwrites the same keys with its own tag.
+There is a provenance tag: "<value>,<provenance>".
+Everything written by flash_factory_nominals.py is "nominal" (model-derived, not
+measured).
 """
 
 PROVENANCE_NOMINAL = "nominal"

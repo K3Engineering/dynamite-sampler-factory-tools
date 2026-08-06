@@ -1,9 +1,9 @@
-"""Factory script 2 of 2: calibration run (currently a dummy) + factory log.
+"""Run board calibration (currently a dummy) + DB log.
 
 Connects to the DUT via the python-api, performs a placeholder
 "calibration" (no stimulus for now; the results are just the model nominals),
 writes them to the Factory namespace (overwriting flash_factory_nominals's
-stuff), and appends a record to the sqlite factory log.
+stuff), and appends a record to the sqlite log.
 
 Usage:
     python run_calibration.py [--address AA:BB:CC:DD:EE:FF] [--board v700P] [--db factory_log.db]

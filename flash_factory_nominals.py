@@ -1,6 +1,6 @@
-"""Factory script 1 of 4: provision model-derived nominal values.
+"""Flash nominal values (EXC, etc)
 
-Runs after firmware flashing, before calibration. The board model is
+Run after firmware flashing, before calibration. The board model is
 auto-detected from the firmware's Hardware Revision BLE characteristic
 (--board overrides), its nominal analog values are looked up and written
 to the Factory namespace over BLE. To wipe the namespace instead, use
@@ -24,11 +24,6 @@ async def detect_board_model(dut: DutKvs) -> str:
     model = await read_characteristic(dut.client, HardwareRevision)
     if not model:
         raise KvsError("Could not read the Hardware Revision characteristic")
-    if model not in BOARD_MODELS:
-        raise KvsError(
-            f"Firmware reports unknown board model {model!r} "
-            f"(known: {', '.join(sorted(BOARD_MODELS))}). Use --board to override."
-        )
     return model
 
 
@@ -43,9 +38,23 @@ async def provision(args: argparse.Namespace) -> int:
         return 0
 
     async with await DutKvs.connect(args.address) as dut:
-        board = args.board or await detect_board_model(dut)
+        detected = await detect_board_model(dut)
+        board = args.board or detected
+        if args.board and args.board != detected:
+            raise KvsError(
+                f"--board {args.board} does not match the firmware's "
+                f"Hardware Revision ({detected!r})"
+            )
+        if board not in BOARD_MODELS:
+            raise KvsError(
+                f"Unknown board model {board!r} "
+                f"(known: {', '.join(sorted(BOARD_MODELS))}). "
+                "Update BOARD_MODELS in nominal_values.py."
+            )
+
         print(
-            f"Board model: {board}{' (from --board)' if args.board else ' (auto-detected)'}"
+            f"Board model: {board}"
+            f"{' (from --board, matches firmware)' if args.board else ' (auto-detected)'}"
         )
 
         if args.dry_run:
