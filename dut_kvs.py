@@ -46,6 +46,15 @@ FOLDER_FACTORY = "F"
 FOLDER_USER = "U"
 FOLDER_SETTINGS = "S"
 
+FOLDER_NAMES = {FOLDER_FACTORY: "Factory", FOLDER_USER: "User", FOLDER_SETTINGS: "Settings"}
+
+# nvs_type_t values reported by the IDX command.
+NVS_TYPE_STR = 0x21
+NVS_TYPE_NAMES = {
+    0x01: "u8", 0x11: "i8", 0x02: "u16", 0x12: "i16", 0x04: "u32", 0x14: "i32",
+    0x08: "u64", 0x18: "i64", NVS_TYPE_STR: "str", 0x42: "blob",
+}
+
 MAX_KEY_LEN = 15  # firmware: USER_KVS_MAX_KEY_LEN
 MAX_VAL_LEN = 128  # firmware: USER_KVS_MAX_VAL_LEN
 
@@ -154,8 +163,8 @@ class DutKvs:
         self._check_key_val(key)
         await self._command(b"DEL", folder, key)
 
-    async def keys(self, folder: str) -> list[str]:
-        """All keys in the namespace, via the IDX command."""
+    async def list_entries(self, folder: str) -> list[tuple[str, int]]:
+        """(key, nvs_type) pairs for the whole namespace, via the IDX command."""
         found = []
         for idx in range(100):  # sanity bound
             try:
@@ -164,5 +173,10 @@ class DutKvs:
                 ).decode()
             except KvsError:
                 break  # IDX past the last key is rejected by the device
-            found.append(payload.split("=")[0])  # payload is "<key>=<nvs type, hex>"
+            key, _, type_hex = payload.partition("=")  # "<key>=<nvs type, hex>"
+            found.append((key, int(type_hex, 16)))
         return found
+
+    async def keys(self, folder: str) -> list[str]:
+        """All keys in the namespace."""
+        return [key for key, _ in await self.list_entries(folder)]

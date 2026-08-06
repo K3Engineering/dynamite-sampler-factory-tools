@@ -1,35 +1,61 @@
-"""Factory script 1 of 2: provision model-derived nominal values.
+"""Factory script 1 of 4: provision model-derived nominal values.
 
-Runs after firmware flashing, before calibration. Looks up the board
-model's nominal analog values and writes them to the Factory namespace
-over BLE.
+Runs after firmware flashing, before calibration. The board model is
+auto-detected from the firmware's Hardware Revision BLE characteristic
+(--board overrides), its nominal analog values are looked up and written
+to the Factory namespace over BLE. To wipe the namespace instead, use
+edit_flash.py.
 
 Usage:
-    python flash_factory_nominals.py --board v700P [--address AA:BB:CC:DD:EE:FF] [--dry-run]
+    python flash_factory_nominals.py [--address AA:BB:CC:DD:EE:FF] [--board v700P] [--dry-run]
 """
 
 import argparse
 import asyncio
 import sys
 
-from dut_kvs import FOLDER_FACTORY, DutKvs, KvsError
-from factory_data import BOARD_MODELS, nominal_entries
+from dut_kvs import FOLDER_FACTORY, DutKvs, HardwareRevision, KvsError
+from nominal_values import BOARD_MODELS, nominal_entries
+from dynamite_sampler_bleak_util import read_characteristic
+
+
+async def detect_board_model(dut: DutKvs) -> str:
+    """Board model compiled into the flashed firmware, e.g. 'v700P'."""
+    model = await read_characteristic(dut.client, HardwareRevision)
+    if not model:
+        raise KvsError("Could not read the Hardware Revision characteristic")
+    if model not in BOARD_MODELS:
+        raise KvsError(
+            f"Firmware reports unknown board model {model!r} "
+            f"(known: {', '.join(sorted(BOARD_MODELS))}). Use --board to override."
+        )
+    return model
 
 
 async def provision(args: argparse.Namespace) -> int:
-    entries = nominal_entries(args.board)
-
-    if args.dry_run:
+    # Fully offline dry-run: no device needed.
+    if args.dry_run and args.board:
         print(
             f"Would write to the Factory namespace ({args.address or 'auto-detected device'}):"
         )
-        for key, value in entries.items():
+        for key, value in nominal_entries(args.board).items():
             print(f"  {key:12s} = {value}")
         return 0
 
     async with await DutKvs.connect(args.address) as dut:
+        board = args.board or await detect_board_model(dut)
+        print(
+            f"Board model: {board}{' (from --board)' if args.board else ' (auto-detected)'}"
+        )
+
+        if args.dry_run:
+            print("Would write to the Factory namespace:")
+            for key, value in nominal_entries(board).items():
+                print(f"  {key:12s} = {value}")
+            return 0
+
         failures = 0
-        for key, value in entries.items():
+        for key, value in nominal_entries(board).items():
             await dut.set(FOLDER_FACTORY, key, value)
             readback = await dut.get(FOLDER_FACTORY, key)
             ok = readback == value
@@ -39,9 +65,9 @@ async def provision(args: argparse.Namespace) -> int:
             )
 
     if failures:
-        print(f"FAILED: {failures} of {len(entries)} keys did not read back")
+        print(f"FAILED: {failures} keys did not read back")
         return 1
-    print(f"Factory nominals for {args.board} provisioned and verified.")
+    print(f"Factory nominals for {board} provisioned and verified.")
     return 0
 
 
@@ -49,9 +75,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--board",
-        required=True,
         choices=sorted(BOARD_MODELS),
-        help="board model, e.g. v700P",
+        help="board model (default: auto-detect from the firmware's "
+        "Hardware Revision characteristic)",
     )
     parser.add_argument(
         "--address",
@@ -60,7 +86,7 @@ def main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="print what would be written, do not connect",
+        help="print what would be written, do not modify the device",
     )
     args = parser.parse_args()
 
