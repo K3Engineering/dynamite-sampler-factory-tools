@@ -1,1 +1,4 @@
 __pycache__/*
+factory_log.db
+captures/
+tests/__pycache__/*
