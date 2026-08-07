@@ -14,13 +14,13 @@ import argparse
 import asyncio
 import sys
 
-from kvs_api_shim import FOLDER_FACTORY, DutKvs, KvsError
+from kvs_api_shim import FOLDER_FACTORY, KvsClient, KvsError
 from nominal_values import BOARD_MODELS, nominal_entries
 import dynamite_sampler_api as ds
 from dynamite_sampler_bleak_util import read_characteristic
 
 
-async def detect_board_model(dut: DutKvs) -> str:
+async def detect_board_model(dut: KvsClient) -> str:
     """Board model compiled into the flashed firmware, e.g. 'v700P'."""
     model = await read_characteristic(dut.client, ds.DeviceInfo.HardwareRevision)
     if not model:
@@ -38,7 +38,7 @@ async def provision(args: argparse.Namespace) -> int:
             print(f"  {key:12s} = {value}")
         return 0
 
-    async with await DutKvs.connect(args.address) as dut:
+    async with await KvsClient.connect(args.address) as dut:
         detected = await detect_board_model(dut)
         board = args.board or detected
         if args.board and args.board != detected:

@@ -22,8 +22,6 @@ from dynamite_sampler_kvs import (  # noqa: E402
     KvsError,
 )
 
-DutKvs = KvsClient
-
 __all__ = [
     "FOLDER_FACTORY",
     "FOLDER_NAMES",
@@ -32,5 +30,4 @@ __all__ = [
     "NVS_TYPE_STR",
     "KvsClient",
     "KvsError",
-    "DutKvs",
 ]
