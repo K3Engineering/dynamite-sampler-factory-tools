@@ -14,12 +14,10 @@ import asyncio
 import json
 import sys
 
-from dut_kvs import (
+from kvs_api_shim import (
     FOLDER_NAMES,
-    NVS_TYPE_NAMES,
     NVS_TYPE_STR,
-    DutKvs,
-    HardwareRevision,
+    KvsClient,
     KvsError,
 )
 import dynamite_sampler_api as ds
@@ -35,28 +33,27 @@ def folder_type(s: str) -> str:
     return s
 
 
-async def dump_namespace(dut: DutKvs, folder: str) -> dict[str, str]:
+async def dump_namespace(device: KvsClient, folder: str) -> dict[str, str]:
     """All key/value pairs in a namespace. Only strings are readable over
     the KVS protocol; other types are shown as placeholders."""
     out = {}
-    for key, nvs_type in await dut.list_entries(folder):
+    for key, nvs_type in await device.list_entries(folder):
         if nvs_type == NVS_TYPE_STR:
             try:
-                out[key] = await dut.get(folder, key)
+                out[key] = await device.get(folder, key)
             except KvsError:
                 out[key] = "<unreadable>"
         else:
-            type_name = NVS_TYPE_NAMES.get(nvs_type, hex(nvs_type))
-            out[key] = f"<{type_name}, not readable over KVS>"
+            out[key] = f"<type {nvs_type:#04x}, not readable over KVS>"
     return out
 
 
 def print_pretty(
-    device: dict, data: dict[str, dict[str, str]], folders: list[str]
+    device_info: dict, data: dict[str, dict[str, str]], folders: list[str]
 ) -> None:
     print(
-        f"Device: {device['address']} ({device['name']})"
-        f"  board {device['board_model']}  fw {device['firmware_rev']}"
+        f"Device: {device_info['address']} ({device_info['name']})"
+        f"  board {device_info['board_model']}  fw {device_info['firmware_rev']}"
     )
     for folder in folders:
         ns = data[folder]
@@ -72,29 +69,31 @@ def print_pretty(
 
 async def inspect(args: argparse.Namespace) -> int:
     folders = args.folder or list(FOLDER_NAMES)
-    async with await DutKvs.connect(args.address) as dut:
-        device = {
-            "address": dut.client.address,
-            "name": dut.device_name,
-            "board_model": await read_characteristic(dut.client, HardwareRevision),
+    async with await KvsClient.connect(args.address) as device:
+        device_info = {
+            "address": device.client.address,
+            "name": device.device_name,
+            "board_model": await read_characteristic(
+                device.client, ds.DeviceInfo.HardwareRevision
+            ),
             "firmware_rev": await read_characteristic(
-                dut.client, ds.DeviceInfo.FirmwareRevision
+                device.client, ds.DeviceInfo.FirmwareRevision
             ),
         }
-        data = {folder: await dump_namespace(dut, folder) for folder in folders}
+        data = {folder: await dump_namespace(device, folder) for folder in folders}
 
     if args.raw:
         print(
             json.dumps(
                 {
-                    "device": device,
+                    "device": device_info,
                     "namespaces": {FOLDER_NAMES[f]: data[f] for f in folders},
                 },
                 indent=2,
             )
         )
     else:
-        print_pretty(device, data, folders)
+        print_pretty(device_info, data, folders)
     return 0
 
 
@@ -102,7 +101,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--address",
-        help="BLE address of the DUT (default: auto-detect, only one may be in range)",
+        help="BLE address of the device (default: auto-detect, only one may be in range)",
     )
     parser.add_argument(
         "--folder",

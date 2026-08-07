@@ -14,14 +14,15 @@ import argparse
 import asyncio
 import sys
 
-from dut_kvs import FOLDER_FACTORY, DutKvs, HardwareRevision, KvsError
+from kvs_api_shim import FOLDER_FACTORY, DutKvs, KvsError
 from nominal_values import BOARD_MODELS, nominal_entries
+import dynamite_sampler_api as ds
 from dynamite_sampler_bleak_util import read_characteristic
 
 
 async def detect_board_model(dut: DutKvs) -> str:
     """Board model compiled into the flashed firmware, e.g. 'v700P'."""
-    model = await read_characteristic(dut.client, HardwareRevision)
+    model = await read_characteristic(dut.client, ds.DeviceInfo.HardwareRevision)
     if not model:
         raise KvsError("Could not read the Hardware Revision characteristic")
     return model

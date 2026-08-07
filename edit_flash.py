@@ -15,7 +15,7 @@ import argparse
 import asyncio
 import sys
 
-from dut_kvs import FOLDER_NAMES, DutKvs, KvsError
+from kvs_api_shim import FOLDER_NAMES, KvsClient, KvsError
 
 
 def folder_type(s: str) -> str:
@@ -27,28 +27,28 @@ def folder_type(s: str) -> str:
     return s
 
 
-async def cmd_get(dut: DutKvs, args: argparse.Namespace) -> int:
-    print(await dut.get(args.folder, args.key))
+async def cmd_get(device: KvsClient, args: argparse.Namespace) -> int:
+    print(await device.get(args.folder, args.key))
     return 0
 
 
-async def cmd_set(dut: DutKvs, args: argparse.Namespace) -> int:
-    await dut.set(args.folder, args.key, args.value)
-    readback = await dut.get(args.folder, args.key)
+async def cmd_set(device: KvsClient, args: argparse.Namespace) -> int:
+    await device.set(args.folder, args.key, args.value)
+    readback = await device.get(args.folder, args.key)
     ok = readback == args.value
     print(f"{args.folder}.{args.key} = {readback} {'ok' if ok else 'MISMATCH'}")
     return 0 if ok else 1
 
 
-async def cmd_del(dut: DutKvs, args: argparse.Namespace) -> int:
-    await dut.delete(args.folder, args.key)
+async def cmd_del(device: KvsClient, args: argparse.Namespace) -> int:
+    await device.delete(args.folder, args.key)
     print(f"Deleted {args.folder}.{args.key}")
     return 0
 
 
-async def cmd_clear(dut: DutKvs, args: argparse.Namespace) -> int:
+async def cmd_clear(device: KvsClient, args: argparse.Namespace) -> int:
     """Delete every key in the namespace."""
-    keys = await dut.keys(args.folder)
+    keys = await device.keys(args.folder)
     if not keys:
         print(f"{FOLDER_NAMES[args.folder]} namespace is already empty.")
         return 0
@@ -56,7 +56,7 @@ async def cmd_clear(dut: DutKvs, args: argparse.Namespace) -> int:
     print(f"{len(keys)} keys in the {FOLDER_NAMES[args.folder]} namespace:")
     for key in keys:
         try:
-            print(f"  {key:12s} = {await dut.get(args.folder, key)}")
+            print(f"  {key:12s} = {await device.get(args.folder, key)}")
         except KvsError:
             print(f"  {key:12s}   (unreadable)")
 
@@ -67,9 +67,9 @@ async def cmd_clear(dut: DutKvs, args: argparse.Namespace) -> int:
             return 2
 
     for key in keys:
-        await dut.delete(args.folder, key)
+        await device.delete(args.folder, key)
 
-    remaining = await dut.keys(args.folder)
+    remaining = await device.keys(args.folder)
     if remaining:
         print(f"FAILED: {len(remaining)} keys remain: {', '.join(remaining)}")
         return 1
@@ -81,7 +81,7 @@ def main() -> None:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--address",
-        help="BLE address of the DUT (default: auto-detect, only one may be in range)",
+        help="BLE address of the device (default: auto-detect, only one may be in range)",
     )
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -113,8 +113,8 @@ def main() -> None:
     args = parser.parse_args()
 
     async def run() -> int:
-        async with await DutKvs.connect(args.address) as dut:
-            return await args.func(dut, args)
+        async with await KvsClient.connect(args.address) as device:
+            return await args.func(device, args)
 
     try:
         sys.exit(asyncio.run(run()))
