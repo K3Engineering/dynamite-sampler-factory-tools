@@ -20,9 +20,9 @@ import dynamite_sampler_api as ds
 from dynamite_sampler_bleak_util import read_characteristic
 
 
-async def detect_board_model(dut: KvsClient) -> str:
+async def detect_board_model(device: KvsClient) -> str:
     """Board model compiled into the flashed firmware, e.g. 'v700P'."""
-    model = await read_characteristic(dut.client, ds.DeviceInfo.HardwareRevision)
+    model = await read_characteristic(device.client, ds.DeviceInfo.HardwareRevision)
     if not model:
         raise KvsError("Could not read the Hardware Revision characteristic")
     return model
@@ -38,8 +38,8 @@ async def provision(args: argparse.Namespace) -> int:
             print(f"  {key:12s} = {value}")
         return 0
 
-    async with await KvsClient.connect(args.address) as dut:
-        detected = await detect_board_model(dut)
+    async with await KvsClient.connect(args.address) as device:
+        detected = await detect_board_model(device)
         board = args.board or detected
         if args.board and args.board != detected:
             raise KvsError(
@@ -66,7 +66,7 @@ async def provision(args: argparse.Namespace) -> int:
 
         failures = 0
         for key, value in nominal_entries(board).items():
-            readback = await dut.set_verified(FOLDER_FACTORY, key, value)
+            readback = await device.set_verified(FOLDER_FACTORY, key, value)
             ok = readback == value
             failures += not ok
             print(
@@ -90,7 +90,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--address",
-        help="BLE address of the DUT (default: auto-detect, only one may be in range)",
+        help="BLE address of the device (default: auto-detect, only one may be in range)",
     )
     parser.add_argument(
         "--dry-run",
