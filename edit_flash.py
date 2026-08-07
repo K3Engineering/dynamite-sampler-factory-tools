@@ -15,16 +15,7 @@ import argparse
 import asyncio
 import sys
 
-from kvs_api_shim import FOLDER_NAMES, KvsClient, KvsError
-
-
-def folder_type(s: str) -> str:
-    s = s.upper()
-    if s not in FOLDER_NAMES:
-        raise argparse.ArgumentTypeError(
-            f"folder must be one of {', '.join(FOLDER_NAMES)} (got {s!r})"
-        )
-    return s
+from kvs_api_shim import FOLDER_NAMES, KvsClient, KvsError, folder_type, set_verified
 
 
 async def cmd_get(device: KvsClient, args: argparse.Namespace) -> int:
@@ -33,8 +24,9 @@ async def cmd_get(device: KvsClient, args: argparse.Namespace) -> int:
 
 
 async def cmd_set(device: KvsClient, args: argparse.Namespace) -> int:
-    await device.set(args.folder, args.key, args.value)
-    readback = await device.get(args.folder, args.key)
+    readback = await set_verified(
+        device, args.folder, args.key, args.value, attempts=1
+    )
     ok = readback == args.value
     print(f"{args.folder}.{args.key} = {readback} {'ok' if ok else 'MISMATCH'}")
     return 0 if ok else 1

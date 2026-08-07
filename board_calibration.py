@@ -22,19 +22,26 @@ import argparse
 import asyncio
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from kvs_api_shim import FOLDER_FACTORY, KvsClient, KvsError
+from kvs_api_shim import (
+    FOLDER_FACTORY,
+    KVS_WRITE_DELAY_S,
+    KvsClient,
+    KvsError,
+    set_many_verified,
+)
 
-import dynamite_sampler_api as ds  # noqa: E402
-from dynamite_sampler_bleak_util import FeedSession, read_characteristic  # noqa: E402
-from capture import FeedRecorder  # noqa: E402
+import dynamite_sampler_api as ds
+from dynamite_sampler_bleak_util import FeedSession, read_characteristic
+from capture import FeedRecorder
 
-import cal_math  # noqa: E402
-import db  # noqa: E402
-from calboard_driver import CalBoard, CalBoardError  # noqa: E402
-from nominal_values import BOARD_MODELS  # noqa: E402
+import cal_math
+import db
+from calboard_driver import CalBoard, CalBoardError
+from nominal_values import BOARD_MODELS
 
 SCRIPT_VERSION = "board_calibration 1.0"
 
@@ -44,10 +51,6 @@ DEFAULT_CAPTURE_DIR = Path(__file__).resolve().with_name("captures")
 # Sweep phases in cal-board channels: one channel per bridge at a time.
 # DUT channel index = cal channel - 1 (fixture wiring).
 PHASES = ((1, 3), (2, 4))
-
-# Grace after stopping the feed: KVS commands are rejected while the device
-# streams (firmware device lock), and unsubscription takes a moment.
-_KVS_WRITE_DELAY_S = 0.5
 
 
 async def read_flash_nominals(dut: KvsClient) -> dict[str, float]:
@@ -67,20 +70,128 @@ async def read_flash_nominals(dut: KvsClient) -> dict[str, float]:
     return out
 
 
-async def set_verified(
-    dut: KvsClient, key: str, value: str, attempts: int = 3
-) -> str | None:
-    """SET + read-back verify, with retries (device-lock grace). Returns the
-    readback on success, None on mismatch; re-raises KvsError after retries."""
-    for attempt in range(attempts):
+@dataclass
+class DutInfo:
+    """Identity and provisioning read from the DUT before the sweep."""
+
+    firmware_rev: str | None
+    adc_config: ds.ADCConfigData  # per-channel PGA readback (span cross-check)
+    board_model: str
+    nominals: dict[str, float]
+
+
+async def check_provisioning(dut: KvsClient, board_override: str | None) -> DutInfo:
+    """Read identity + analog nominals, cross-checked against the firmware's
+    hardware revision."""
+    firmware_rev = await read_characteristic(
+        dut.client, ds.DeviceInfo.FirmwareRevision
+    )
+    hw_rev = await read_characteristic(dut.client, ds.DeviceInfo.HardwareRevision)
+    adc_config = await read_characteristic(dut.client, ds.DynamiteSampler.ADCConfig)
+    if adc_config is None:
+        raise KvsError("ADC config unreadable — cannot cross-check the span")
+
+    board_model = board_override
+    if board_model is None:
         try:
-            await dut.set(FOLDER_FACTORY, key, value)
-            readback = await dut.get(FOLDER_FACTORY, key)
-            return readback if readback == value else None
-        except KvsError:
-            if attempt + 1 == attempts:
-                raise
-            await asyncio.sleep(_KVS_WRITE_DELAY_S)
+            board_model = await dut.get(FOLDER_FACTORY, "board_model")
+        except KvsError as e:
+            raise KvsError(
+                "board_model not provisioned — run flash_factory_nominals.py "
+                "first (or pass --board)"
+            ) from e
+    if board_model not in BOARD_MODELS:
+        raise KvsError(f"unknown board model {board_model!r}")
+    if hw_rev and hw_rev != board_model:
+        raise KvsError(
+            f"provisioned board_model {board_model!r} does not match the "
+            f"firmware's Hardware Revision {hw_rev!r} — wrong unit or bad "
+            "provisioning"
+        )
+    nominals = await read_flash_nominals(dut)
+    return DutInfo(firmware_rev, adc_config, board_model, nominals)
+
+
+async def sweep(
+    cal: CalBoard, recorder: FeedRecorder, dwell: float, guard: float
+) -> list[dict]:
+    """Step the cal board through the reversal sweep while the feed records.
+    Returns per-state window metadata (SSN bounds, confirmations)."""
+    seg_meta = []
+    for phase_idx, (cha, chb) in enumerate(PHASES):
+        for seq_idx, mv in enumerate(cal_math.SWEEP_SEQUENCE_MV):
+            t_cmd = time.time()
+            confirm = await asyncio.to_thread(cal.set_channels, {cha: mv, chb: mv})
+            await asyncio.sleep(guard)
+            ssn_start = (recorder.last_ssn or 0) + 1
+            await asyncio.sleep(dwell)
+            ssn_end = recorder.last_ssn
+            seg_meta.append(
+                {
+                    "phase": phase_idx,
+                    "seq_idx": seq_idx,
+                    "mv": mv,
+                    "channels": (cha, chb),
+                    "t_cmd": t_cmd,
+                    "ssn_start": ssn_start,
+                    "ssn_end": ssn_end,
+                    "confirm": confirm,
+                }
+            )
+            print(
+                f"  phase {phase_idx} ch{cha}+{chb} {mv:+3d} mV "
+                f"(ssn {ssn_start}..{ssn_end})"
+            )
+    return seg_meta
+
+
+def reduce_segments(
+    recorder: FeedRecorder, seg_meta: list[dict]
+) -> list[cal_math.SegmentResult]:
+    """Segment the capture per commanded state (SSN window) and reduce each
+    window to per-channel statistics."""
+    segments = []
+    for meta in seg_meta:
+        ssn_start, ssn_end = meta["ssn_start"], meta["ssn_end"]
+        rows = (
+            recorder.window(ssn_start, ssn_end)
+            if ssn_end is not None and ssn_end >= ssn_start
+            else []
+        )
+        means, stds = cal_math.segment_stats(rows)
+        expected = ssn_end - ssn_start + 1 if rows else 0
+        segments.append(
+            cal_math.SegmentResult(
+                phase=meta["phase"],
+                seq_idx=meta["seq_idx"],
+                commanded_mv=meta["mv"],
+                cal_channels=meta["channels"],
+                t_cmd_unix=meta["t_cmd"],
+                ssn_start=ssn_start,
+                ssn_end=ssn_end,
+                n_samples=len(rows),
+                missing=expected - len(rows),
+                means=means,
+                stds=stds,
+            )
+        )
+    return segments
+
+
+async def write_entries(dut: KvsClient, entries: dict[str, str]) -> int:
+    """Write calibration entries to the Factory namespace (read-back verified).
+    Returns the number of mismatched keys."""
+    readbacks = await set_many_verified(dut, FOLDER_FACTORY, entries)
+    mismatches = 0
+    for key, value in entries.items():
+        readback = readbacks[key]
+        ok = readback == value
+        mismatches += not ok
+        print(
+            f"  {key:12s} = {value:56s} "
+            f"{'ok' if ok else f'MISMATCH (read {readback!r})'}"
+        )
+    return mismatches
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -95,32 +206,8 @@ async def run(args: argparse.Namespace) -> int:
     )
 
     async with await KvsClient.connect(args.address) as dut:
-        firmware_rev = await read_characteristic(
-            dut.client, ds.DeviceInfo.FirmwareRevision
-        )
-        hw_rev = await read_characteristic(dut.client, ds.DeviceInfo.HardwareRevision)
-        adc_config = await read_characteristic(dut.client, ds.DynamiteSampler.ADCConfig)
-        if adc_config is None:
-            raise KvsError("ADC config unreadable — cannot cross-check the span")
-
-        board_model = args.board
-        if board_model is None:
-            try:
-                board_model = await dut.get(FOLDER_FACTORY, "board_model")
-            except KvsError as e:
-                raise KvsError(
-                    "board_model not provisioned — run flash_factory_nominals.py "
-                    "first (or pass --board)"
-                ) from e
-        if board_model not in BOARD_MODELS:
-            raise KvsError(f"unknown board model {board_model!r}")
-        if hw_rev and hw_rev != board_model:
-            raise KvsError(
-                f"provisioned board_model {board_model!r} does not match the "
-                f"firmware's Hardware Revision {hw_rev!r} — wrong unit or bad "
-                "provisioning"
-            )
-        nominals = await read_flash_nominals(dut)
+        dut_info = await check_provisioning(dut, args.board)
+        nominals = dut_info.nominals
 
         cal = await asyncio.to_thread(CalBoard.connect, args.cal_port)
         print(f"Calibration board on {cal.port}: {cal.fw_id}")
@@ -131,7 +218,7 @@ async def run(args: argparse.Namespace) -> int:
             cal_math.expected_span_counts(
                 nominals["adc_fsr"], nominals["afe_gain"], pga, nominals["exc"]
             )
-            for pga in adc_config.gains
+            for pga in dut_info.adc_config.gains
         ]
 
         started = datetime.now(timezone.utc)
@@ -149,8 +236,8 @@ async def run(args: argparse.Namespace) -> int:
                 "ts_utc": started.isoformat(timespec="seconds"),
                 "device_address": dut.client.address,
                 "device_name": dut.device_name,
-                "board_model": board_model,
-                "firmware_rev": firmware_rev,
+                "board_model": dut_info.board_model,
+                "firmware_rev": dut_info.firmware_rev,
                 "cal_board_id": cal.fw_id,
                 "cal_port": cal.port,
                 "exc_mv": args.exc_mv,
@@ -166,9 +253,11 @@ async def run(args: argparse.Namespace) -> int:
         session = FeedSession(
             dut.client,
             callbacks_feeddata=[recorder],
-            device_info={"FirmwareRevision": firmware_rev, "ADCConfig": adc_config},
+            device_info={
+                "FirmwareRevision": dut_info.firmware_rev,
+                "ADCConfig": dut_info.adc_config,
+            },
         )
-        seg_meta = []
         try:
             await session.start()
             deadline = time.monotonic() + 10.0
@@ -178,62 +267,14 @@ async def run(args: argparse.Namespace) -> int:
                 await asyncio.sleep(0.05)
             print(f"Feed running (first SSN {recorder.last_ssn}). Sweeping...")
 
-            for phase_idx, (cha, chb) in enumerate(PHASES):
-                for seq_idx, mv in enumerate(cal_math.SWEEP_SEQUENCE_MV):
-                    t_cmd = time.time()
-                    confirm = await asyncio.to_thread(
-                        cal.set_channels, {cha: mv, chb: mv}
-                    )
-                    await asyncio.sleep(args.guard)
-                    ssn_start = (recorder.last_ssn or 0) + 1
-                    await asyncio.sleep(args.dwell)
-                    ssn_end = recorder.last_ssn
-                    seg_meta.append(
-                        {
-                            "phase": phase_idx,
-                            "seq_idx": seq_idx,
-                            "mv": mv,
-                            "channels": (cha, chb),
-                            "t_cmd": t_cmd,
-                            "ssn_start": ssn_start,
-                            "ssn_end": ssn_end,
-                            "confirm": confirm,
-                        }
-                    )
-                    print(
-                        f"  phase {phase_idx} ch{cha}+{chb} {mv:+3d} mV "
-                        f"(ssn {ssn_start}..{ssn_end})"
-                    )
+            seg_meta = await sweep(cal, recorder, args.dwell, args.guard)
 
             # Stop the stream before KVS access (firmware device lock).
             await session.stop()
-            await asyncio.sleep(_KVS_WRITE_DELAY_S)
+            await asyncio.sleep(KVS_WRITE_DELAY_S)
 
-            # Segment the capture into per-state windows and reduce.
-            segments = []
-            for meta in seg_meta:
-                ssn_start, ssn_end = meta["ssn_start"], meta["ssn_end"]
-                rows = (
-                    recorder.window(ssn_start, ssn_end)
-                    if ssn_end is not None and ssn_end >= ssn_start
-                    else []
-                )
-                means, stds = cal_math.segment_stats(rows)
-                expected = ssn_end - ssn_start + 1 if rows else 0
-                seg = cal_math.SegmentResult(
-                    phase=meta["phase"],
-                    seq_idx=meta["seq_idx"],
-                    commanded_mv=meta["mv"],
-                    cal_channels=meta["channels"],
-                    t_cmd_unix=meta["t_cmd"],
-                    ssn_start=ssn_start,
-                    ssn_end=ssn_end,
-                    n_samples=len(rows),
-                    missing=expected - len(rows),
-                    means=means,
-                    stds=stds,
-                )
-                segments.append(seg)
+            segments = reduce_segments(recorder, seg_meta)
+            for meta, seg in zip(seg_meta, segments):
                 db.insert_segment(con, run_id, seg, confirm=meta["confirm"])
 
             config_values = cal_math.collect_config_values(segments)
@@ -262,15 +303,7 @@ async def run(args: argparse.Namespace) -> int:
                     print(f"  {key:12s} = {value}")
                 return 0
 
-            mismatches = 0
-            for key, value in entries.items():
-                readback = await set_verified(dut, key, value)
-                ok = readback == value
-                mismatches += not ok
-                print(
-                    f"  {key:12s} = {value:56s} "
-                    f"{'ok' if ok else f'MISMATCH (read {readback!r})'}"
-                )
+            mismatches = await write_entries(dut, entries)
             if mismatches:
                 db.finish_run(con, run_id, "fail", f"{mismatches} keys misverified")
                 print(f"FAILED: {mismatches} of {len(entries)} keys did not read back")
@@ -282,8 +315,8 @@ async def run(args: argparse.Namespace) -> int:
                     "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "device_address": dut.client.address,
                     "device_name": dut.device_name,
-                    "board_model": board_model,
-                    "firmware_rev": firmware_rev,
+                    "board_model": dut_info.board_model,
+                    "firmware_rev": dut_info.firmware_rev,
                     "keys_written": entries,
                     "script": SCRIPT_VERSION,
                     "run_id": run_id,

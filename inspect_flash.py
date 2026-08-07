@@ -19,18 +19,10 @@ from kvs_api_shim import (
     NVS_TYPE_STR,
     KvsClient,
     KvsError,
+    folder_type,
 )
 import dynamite_sampler_api as ds
 from dynamite_sampler_bleak_util import read_characteristic
-
-
-def folder_type(s: str) -> str:
-    s = s.upper()
-    if s not in FOLDER_NAMES:
-        raise argparse.ArgumentTypeError(
-            f"folder must be one of {', '.join(FOLDER_NAMES)} (got {s!r})"
-        )
-    return s
 
 
 async def dump_namespace(device: KvsClient, folder: str) -> dict[str, str]:
