@@ -9,14 +9,15 @@ PROVENANCE_NOMINAL = "nominal"
 KVS_VER = "1"
 
 # EXC and AFE gain for v300-v500 are unverified guesses, as in the firmware script.
+# Note that adc_gain is generated & read at runtime instead
 BOARD_MODELS: dict[str, dict[str, str]] = {
-    "v300": {"adc_fsr": "1.2", "adc_gain": "1.0", "exc": "4.53", "afe_gain": "50.0"},
-    "v400": {"adc_fsr": "1.2", "adc_gain": "1.0", "exc": "4.53", "afe_gain": "50.0"},
-    "v500": {"adc_fsr": "1.2", "adc_gain": "1.0", "exc": "4.53", "afe_gain": "50.0"},
-    "v600L": {"adc_fsr": "1.2", "adc_gain": "1.0", "exc": "2.8", "afe_gain": "1.0"},
-    "v600P": {"adc_fsr": "1.2", "adc_gain": "1.0", "exc": "4.53", "afe_gain": "101.0"},
-    "v700L": {"adc_fsr": "1.2", "adc_gain": "1.0", "exc": "2.8", "afe_gain": "1.0"},
-    "v700P": {"adc_fsr": "1.2", "adc_gain": "1.0", "exc": "4.53", "afe_gain": "101.0"},
+    "v300": {"adc_fsr": "1.2", "exc": "4.53", "afe_gain": "50.0"},
+    "v400": {"adc_fsr": "1.2", "exc": "4.53", "afe_gain": "50.0"},
+    "v500": {"adc_fsr": "1.2", "exc": "4.53", "afe_gain": "50.0"},
+    "v600L": {"adc_fsr": "1.2", "exc": "2.8", "afe_gain": "1.0"},
+    "v600P": {"adc_fsr": "1.2", "exc": "4.53", "afe_gain": "101.0"},
+    "v700L": {"adc_fsr": "1.2", "exc": "2.8", "afe_gain": "1.0"},
+    "v700P": {"adc_fsr": "1.2", "exc": "4.53", "afe_gain": "101.0"},
 }
 
 
