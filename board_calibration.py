@@ -26,13 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from kvs_api_shim import (
-    FOLDER_FACTORY,
-    KVS_WRITE_DELAY_S,
-    KvsClient,
-    KvsError,
-    set_many_verified,
-)
+from kvs_api_shim import FOLDER_FACTORY, KVS_WRITE_DELAY_S, KvsClient, KvsError
 
 import dynamite_sampler_api as ds
 from dynamite_sampler_bleak_util import FeedSession, read_characteristic
@@ -181,7 +175,7 @@ def reduce_segments(
 async def write_entries(dut: KvsClient, entries: dict[str, str]) -> int:
     """Write calibration entries to the Factory namespace (read-back verified).
     Returns the number of mismatched keys."""
-    readbacks = await set_many_verified(dut, FOLDER_FACTORY, entries)
+    readbacks = await dut.set_many_verified(FOLDER_FACTORY, entries)
     mismatches = 0
     for key, value in entries.items():
         readback = readbacks[key]

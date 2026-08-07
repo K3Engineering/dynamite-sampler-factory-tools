@@ -14,7 +14,7 @@ import argparse
 import asyncio
 import sys
 
-from kvs_api_shim import FOLDER_FACTORY, KvsClient, KvsError, set_verified
+from kvs_api_shim import FOLDER_FACTORY, KvsClient, KvsError
 from nominal_values import BOARD_MODELS, nominal_entries
 import dynamite_sampler_api as ds
 from dynamite_sampler_bleak_util import read_characteristic
@@ -66,7 +66,7 @@ async def provision(args: argparse.Namespace) -> int:
 
         failures = 0
         for key, value in nominal_entries(board).items():
-            readback = await set_verified(dut, FOLDER_FACTORY, key, value)
+            readback = await dut.set_verified(FOLDER_FACTORY, key, value)
             ok = readback == value
             failures += not ok
             print(

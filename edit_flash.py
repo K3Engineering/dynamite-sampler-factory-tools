@@ -15,7 +15,7 @@ import argparse
 import asyncio
 import sys
 
-from kvs_api_shim import FOLDER_NAMES, KvsClient, KvsError, folder_type, set_verified
+from kvs_api_shim import FOLDER_NAMES, KvsClient, KvsError, folder_type
 
 
 async def cmd_get(device: KvsClient, args: argparse.Namespace) -> int:
@@ -24,8 +24,8 @@ async def cmd_get(device: KvsClient, args: argparse.Namespace) -> int:
 
 
 async def cmd_set(device: KvsClient, args: argparse.Namespace) -> int:
-    readback = await set_verified(
-        device, args.folder, args.key, args.value, attempts=1
+    readback = await device.set_verified(
+        args.folder, args.key, args.value, attempts=1
     )
     ok = readback == args.value
     print(f"{args.folder}.{args.key} = {readback} {'ok' if ok else 'MISMATCH'}")
