@@ -329,6 +329,15 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
+    # FeedSession.stop() relies on task cancellation reaching the feed pump;
+    # the legacy asyncio.wait_for() on Python < 3.12 can silently swallow it
+    # and hang the script after the sweep. Refuse to run there.
+    assert sys.version_info >= (3, 12), (
+        f"Python >= 3.12 required, running {sys.version.split()[0]} "
+        "(3.11's asyncio.wait_for can swallow task cancellation and hang "
+        "the feed shutdown)"
+    )
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--address",
