@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS calibrations (
     board_model TEXT,
     firmware_rev TEXT,
     keys_written TEXT NOT NULL,  -- JSON object: {factory key: value}
-    script TEXT NOT NULL
+    script TEXT NOT NULL,
+    run_id INTEGER REFERENCES runs(id)
 )
 """
 
