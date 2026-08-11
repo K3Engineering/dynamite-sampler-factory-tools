@@ -10,8 +10,15 @@ SYNTH_COUNTS_PER_MVV = 2.0e6
 SYNTH_STD = 5.0
 
 
-def make_segments(offset=SYNTH_OFFSET, cmvv=SYNTH_COUNTS_PER_MVV,
-                  std=SYNTH_STD, n=1000, missing=0, scramble=False):
+def make_segments(
+    offset=SYNTH_OFFSET,
+    cmvv=SYNTH_COUNTS_PER_MVV,
+    std=SYNTH_STD,
+    n=1000,
+    missing=0,
+    scramble=False,
+    temp=23.0,
+):
     """A full synthetic run: 2 phases x 9 sweep states, noise-free means."""
     setpoints = cal_math.ladder_setpoints_mv_per_v()
     segments = []
@@ -36,6 +43,7 @@ def make_segments(offset=SYNTH_OFFSET, cmvv=SYNTH_COUNTS_PER_MVV,
                     missing=missing,
                     means=tuple(means),
                     stds=(std,) * 4,
+                    temp_c=temp,
                 )
             )
     return segments
@@ -66,7 +74,9 @@ def test_setpoints_nominal():
 def test_setpoints_track_resistor_drift():
     sp = cal_math.ladder_setpoints_mv_per_v()
     # A heavier top 10k dilutes every setpoint proportionally.
-    bigger = cal_math.ladder_setpoints_mv_per_v((20000.0,) + tuple(cal_math.NOMINAL_LADDER_RESISTORS[1:]))
+    bigger = cal_math.ladder_setpoints_mv_per_v(
+        (20000.0,) + tuple(cal_math.NOMINAL_LADDER_RESISTORS[1:])
+    )
     assert bigger[0] == pytest.approx(1000.0 * 40 / 30040)
     assert bigger[0] < sp[0]
 
@@ -123,9 +133,7 @@ def test_gate_detects_pass_delta():
     segments = make_segments()
     for seg in segments:
         if seg.commanded_mv == 5 and seg.seq_idx == 3:  # second +5 pass
-            seg.means = tuple(
-                None if m is None else m + 1000.0 for m in seg.means
-            )
+            seg.means = tuple(None if m is None else m + 1000.0 for m in seg.means)
     failures = gate(segments)
     assert any("pass delta" in f for f in failures)
 
@@ -134,9 +142,7 @@ def test_gate_detects_zero_drift():
     segments = make_segments()
     for seg in segments:
         if seg.commanded_mv == 0 and seg.seq_idx == 8:  # last zero
-            seg.means = tuple(
-                None if m is None else m + 500.0 for m in seg.means
-            )
+            seg.means = tuple(None if m is None else m + 500.0 for m in seg.means)
     failures = gate(segments)
     assert any("zero spread" in f for f in failures)
 
@@ -161,6 +167,13 @@ def test_gate_detects_dropped_samples():
     assert any("dropped samples" in f for f in failures)
 
 
+def test_gate_detects_temp_spread():
+    segments = make_segments()
+    segments[0].temp_c = 25.0  # 2 C above the rest of the run
+    failures = gate(segments)
+    assert any("temp spread" in f for f in failures)
+
+
 # -- flash entries -----------------------------------------------------------
 
 
@@ -168,12 +181,22 @@ def test_build_flash_entries_roundtrip():
     segments = make_segments()
     readings = cal_math.final_readings(cal_math.collect_config_values(segments))
     entries = cal_math.build_flash_entries(
-        readings, "calboard-fw 1.0.0", exc_mv=4527.0,
-        now=__import__("datetime").datetime(2026, 8, 7, tzinfo=__import__("datetime").timezone.utc),
+        readings,
+        "calboard-fw 1.0.0",
+        exc_mv=4527.0,
+        now=__import__("datetime").datetime(
+            2026, 8, 7, tzinfo=__import__("datetime").timezone.utc
+        ),
+        temp_dut_c=-999.0,
+        temp_calboard_c=23.4375,
     )
     assert set(entries) == {
         *(f"ch{i}.{k}" for i in range(4) for k in ("r", "raw")),
-        "cal.date", "cal.board", "cal.r.prov", "cal.exc.mv",
+        "cal.date",
+        "cal.board",
+        "cal.r.prov",
+        "cal.temp",
+        "cal.exc.mv",
     }
     raw = [float(v) for v in entries["ch0.raw"].split(",")]
     assert len(raw) == cal_math.CAL_POINT_COUNT
@@ -182,11 +205,42 @@ def test_build_flash_entries_roundtrip():
     assert entries["ch0.r"] == "10000,10,10,10,10,10000"
     assert entries["cal.r.prov"] == "nominal"
     assert entries["cal.exc.mv"] == "4527"
+    assert entries["cal.temp"] == "-999,23.4375"  # placeholder DUT temp
     assert entries["cal.date"].startswith("2026-08-07T")
 
 
 def test_build_flash_entries_without_exc():
     segments = make_segments()
     readings = cal_math.final_readings(cal_math.collect_config_values(segments))
-    entries = cal_math.build_flash_entries(readings, "x")
+    entries = cal_math.build_flash_entries(
+        readings, "x", temp_dut_c=-999.0, temp_calboard_c=23.0
+    )
     assert "cal.exc.mv" not in entries
+
+
+def test_build_flash_entries_provenance_keys():
+    segments = make_segments()
+    readings = cal_math.final_readings(cal_math.collect_config_values(segments))
+    entries = cal_math.build_flash_entries(
+        readings,
+        "calboard-fw 1.0.0",
+        tool="board_calibration 1.0",
+        origin="factory",
+        adc_gains=[1, 1, 1, 1],
+        temp_dut_c=-999.0,
+        temp_calboard_c=23.0,
+    )
+    assert entries["cal.tool"] == "board_calibration 1.0"
+    assert entries["cal.origin"] == "factory"
+    assert entries["cal.adc"] == "1,1,1,1"
+    # All within the KVS limits (keys <= 15 chars, values <= 128).
+    for key, value in entries.items():
+        assert len(key) <= 15
+        assert len(value) <= 128
+
+    # Absent provenance: no keys stamped (older readers see the old layout).
+    bare = cal_math.build_flash_entries(
+        readings, "x", temp_dut_c=-999.0, temp_calboard_c=23.0
+    )
+    for key in ("cal.tool", "cal.origin", "cal.adc"):
+        assert key not in bare

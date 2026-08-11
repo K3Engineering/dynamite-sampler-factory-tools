@@ -42,7 +42,13 @@ CFG_NEG_MID = 3
 CFG_NEG_FS = 4
 
 # Bridge output label (mV) -> config index (storage order above).
-MV_TO_CONFIG = {10: CFG_POS_FS, 5: CFG_POS_MID, 0: CFG_ZERO, -5: CFG_NEG_MID, -10: CFG_NEG_FS}
+MV_TO_CONFIG = {
+    10: CFG_POS_FS,
+    5: CFG_POS_MID,
+    0: CFG_ZERO,
+    -5: CFG_NEG_MID,
+    -10: CFG_NEG_FS,
+}
 
 # Zero-anchored reversal sweep: starts and ends on the dead short (drift
 # closure check), interior points visited once per approach direction
@@ -82,8 +88,9 @@ def expected_counts_per_mvv(adc_fsr_v, afe_gain, pga_gain, exc_v):
     return ADC_COUNTS_PER_POLARITY * afe_gain * pga_gain / (adc_fsr_v * 1000.0) * exc_v
 
 
-def expected_span_counts(adc_fsr_v, afe_gain, pga_gain, exc_v,
-                         resistors=NOMINAL_LADDER_RESISTORS):
+def expected_span_counts(
+    adc_fsr_v, afe_gain, pga_gain, exc_v, resistors=NOMINAL_LADDER_RESISTORS
+):
     """Expected count difference between the +FS and -FS configs."""
     sp = ladder_setpoints_mv_per_v(resistors)
     return expected_counts_per_mvv(adc_fsr_v, afe_gain, pga_gain, exc_v) * (
@@ -122,6 +129,7 @@ class SegmentResult:
     missing: int  # emitted-but-not-received samples inside the window
     means: tuple  # per DUT channel (4), None when the window was empty
     stds: tuple
+    temp_c: float  # cal board TMP118 read at the end of this segment
 
     @property
     def config_idx(self):
@@ -161,6 +169,7 @@ class GateParams:
     pass_tol_counts: float = 200.0  # |pass1 - pass2| on the interior points
     zero_tol_counts: float = 200.0  # spread of the three zero visits
     span_tol: float = 0.10  # |measured/expected - 1| on the +/-FS span
+    max_temp_spread_c: float = 0.2  # cal board temp drift over the run
 
 
 def gate_run(segments, config_values, expected_span_by_ch, params):
@@ -177,6 +186,13 @@ def gate_run(segments, config_values, expected_span_by_ch, params):
             std = seg.stds[cal_ch - 1]
             if std is not None and std > params.max_std_counts:
                 failures.append(f"{label}: ch{cal_ch - 1} window std {std:.1f} counts")
+
+    temps = [seg.temp_c for seg in segments]
+    spread = max(temps) - min(temps)
+    if spread > params.max_temp_spread_c:
+        failures.append(
+            f"cal board temp spread {spread:.2f} C > {params.max_temp_spread_c}"
+        )
 
     for dut_ch in range(4):
         by_config = config_values.get(dut_ch, {})
@@ -235,12 +251,27 @@ def _fmt(value):
     return f"{value:.9g}"
 
 
-def build_flash_entries(readings, cal_board_id, exc_mv=None, now=None,
-                        resistors=NOMINAL_LADDER_RESISTORS,
-                        r_provenance=PROVENANCE_NOMINAL):
+def build_flash_entries(
+    readings,
+    cal_board_id,
+    exc_mv=None,
+    now=None,
+    resistors=NOMINAL_LADDER_RESISTORS,
+    r_provenance=PROVENANCE_NOMINAL,
+    tool=None,
+    origin=None,
+    adc_gains=None,
+    *,
+    temp_dut_c,
+    temp_calboard_c,
+):
     """Factory-namespace entries for a passed calibration.
 
     readings: {dut_ch: [5 config means, storage order]} for all 4 channels.
+    tool: host script version (cal.tool). origin: e.g. "factory" (cal.origin).
+    temp_dut_c/temp_calboard_c: temperatures at calibration (cal.temp,
+    "dut,calboard"); temp_dut_c is a placeholder until the DUT sensor is
+    plumbed.
     Keys/values are KVS strings; the key/value length limits are enforced by
     the transport (KvsClient.set), not here.
     """
@@ -252,6 +283,13 @@ def build_flash_entries(readings, cal_board_id, exc_mv=None, now=None,
     entries["cal.date"] = now.isoformat(timespec="seconds")
     entries["cal.board"] = cal_board_id
     entries["cal.r.prov"] = r_provenance
+    entries["cal.temp"] = f"{_fmt(temp_dut_c)},{_fmt(temp_calboard_c)}"
     if exc_mv is not None:
         entries["cal.exc.mv"] = _fmt(exc_mv)
+    if tool is not None:
+        entries["cal.tool"] = tool
+    if origin is not None:
+        entries["cal.origin"] = origin
+    if adc_gains is not None:
+        entries["cal.adc"] = ",".join(_fmt(g) for g in adc_gains)
     return entries

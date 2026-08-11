@@ -94,6 +94,23 @@ class CalBoard:
         except TransportError as e:
             raise CalBoardError(f"transport error during {code!r}: {e}") from e
 
+    def _eval(self, expr: str):
+        """Evaluate an expression on the board; returns the parsed value."""
+        try:
+            return self._transport.eval(expr)
+        except TransportExecError as e:
+            raise CalBoardError(f"board rejected {expr!r}: {e}") from e
+        except TransportError as e:
+            raise CalBoardError(f"transport error during {expr!r}: {e}") from e
+
+    def read_temperature(self) -> float:
+        """TMP118 temperature of the calibration board, °C."""
+        return float(self._eval("therm.celsius()"))
+
+    def unique_id(self) -> int:
+        """TMP118 48-bit unique ID — the physical board's identity."""
+        return int(self._eval("therm.unique_id()"))
+
     def set_channels(self, channel_voltages: dict) -> str:
         """{channel: mV}; at most one channel per bridge (calboard.py rule)."""
         if not channel_voltages:

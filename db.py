@@ -19,9 +19,8 @@ CREATE TABLE IF NOT EXISTS runs (
     board_model TEXT,
     firmware_rev TEXT,
     cal_board_id TEXT,
+    cal_board_uid TEXT,     -- TMP118 48-bit unique ID (hex): physical board identity
     cal_port TEXT,
-    temp_dut_c REAL,        -- reserved, not yet plumbed (NULL)
-    temp_calboard_c REAL,   -- reserved, not yet plumbed (NULL)
     exc_mv REAL,            -- optional manual DMM entry (cal.exc.mv)
     csv_path TEXT,
     dwell_s REAL,
@@ -46,6 +45,7 @@ CREATE TABLE IF NOT EXISTS segments (
     ssn_end INTEGER,
     n_samples INTEGER,
     missing INTEGER,             -- emitted-but-not-received samples in window
+    temp_calboard_c REAL NOT NULL,  -- TMP118 read at the end of this segment
     means TEXT,                  -- JSON list of 4 per-channel means (null if empty)
     stds TEXT                    -- JSON list of 4 per-channel sample stds
 )
@@ -66,20 +66,11 @@ CREATE TABLE IF NOT EXISTS calibrations (
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
-    """Open the factory log, creating/migrating the schema as needed."""
+    """Open the factory log, creating the schema as needed."""
     con = sqlite3.connect(db_path)
     con.execute(_SCHEMA_RUNS)
     con.execute(_SCHEMA_SEGMENTS)
     con.execute(_SCHEMA_CALIBRATIONS)
-    # Migrations for DBs created before these columns existed.
-    columns = [row[1] for row in con.execute("PRAGMA table_info(calibrations)")]
-    if "run_id" not in columns:
-        con.execute(
-            "ALTER TABLE calibrations ADD COLUMN run_id INTEGER REFERENCES runs(id)"
-        )
-    columns = [row[1] for row in con.execute("PRAGMA table_info(segments)")]
-    if "confirm" not in columns:
-        con.execute("ALTER TABLE segments ADD COLUMN confirm TEXT")
     con.commit()
     return con
 
@@ -89,9 +80,9 @@ def insert_run(con: sqlite3.Connection, record: dict) -> int:
     cur = con.execute(
         "INSERT INTO runs"
         " (ts_utc, device_address, device_name, board_model, firmware_rev,"
-        "  cal_board_id, cal_port, temp_dut_c, temp_calboard_c, exc_mv,"
+        "  cal_board_id, cal_board_uid, cal_port, exc_mv,"
         "  csv_path, dwell_s, guard_s, script)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             record["ts_utc"],
             record["device_address"],
@@ -99,9 +90,8 @@ def insert_run(con: sqlite3.Connection, record: dict) -> int:
             record.get("board_model"),
             record.get("firmware_rev"),
             record.get("cal_board_id"),
+            record.get("cal_board_uid"),
             record.get("cal_port"),
-            record.get("temp_dut_c"),
-            record.get("temp_calboard_c"),
             record.get("exc_mv"),
             record.get("csv_path"),
             record.get("dwell_s"),
@@ -122,8 +112,9 @@ def insert_segment(
     con.execute(
         "INSERT INTO segments"
         " (run_id, phase, seq_idx, commanded_mv, cal_channels, confirm,"
-        "  t_cmd_unix, ssn_start, ssn_end, n_samples, missing, means, stds)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "  t_cmd_unix, ssn_start, ssn_end, n_samples, missing, temp_calboard_c,"
+        "  means, stds)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             run_id,
             seg.phase,
@@ -136,6 +127,7 @@ def insert_segment(
             seg.ssn_end,
             seg.n_samples,
             seg.missing,
+            seg.temp_c,
             json.dumps(list(seg.means)),
             json.dumps(list(seg.stds)),
         ),

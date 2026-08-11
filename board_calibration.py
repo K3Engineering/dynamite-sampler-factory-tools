@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import asyncio
+import statistics
 import sys
 import time
 from dataclasses import dataclass
@@ -37,7 +38,11 @@ import db
 from calboard_driver import CalBoard, CalBoardError
 from nominal_values import BOARD_MODELS
 
-SCRIPT_VERSION = "board_calibration 1.0"
+SCRIPT_VERSION = "board_calibration 1.1"
+
+# TODO: read the DUT's onboard temperature sensor and plumb it through
+# (cal.temp dut field, segments table). Placeholder until then.
+DUT_TEMP_PLACEHOLDER_C = -999.0
 
 DEFAULT_DB_PATH = Path(__file__).resolve().with_name("factory_log.db")
 DEFAULT_CAPTURE_DIR = Path(__file__).resolve().with_name("captures")
@@ -120,6 +125,7 @@ async def sweep(
             ssn_start = (recorder.last_ssn or 0) + 1
             await asyncio.sleep(dwell)
             ssn_end = recorder.last_ssn
+            temp_c = await asyncio.to_thread(cal.read_temperature)
             seg_meta.append(
                 {
                     "phase": phase_idx,
@@ -129,12 +135,13 @@ async def sweep(
                     "t_cmd": t_cmd,
                     "ssn_start": ssn_start,
                     "ssn_end": ssn_end,
+                    "temp_c": temp_c,
                     "confirm": confirm,
                 }
             )
             print(
                 f"  phase {phase_idx} ch{cha}+{chb} {mv:+3d} mV "
-                f"(ssn {ssn_start}..{ssn_end})"
+                f"(ssn {ssn_start}..{ssn_end}, {temp_c:.2f} C)"
             )
     return seg_meta
 
@@ -167,6 +174,7 @@ def reduce_segments(
                 missing=expected - len(rows),
                 means=means,
                 stds=stds,
+                temp_c=meta["temp_c"],
             )
         )
     return segments
@@ -197,6 +205,7 @@ async def run(args: argparse.Namespace) -> int:
         pass_tol_counts=args.pass_tol_counts,
         zero_tol_counts=args.zero_tol_counts,
         span_tol=args.span_tol,
+        max_temp_spread_c=args.max_temp_spread_c,
     )
 
     async with await KvsClient.connect(args.address) as dut:
@@ -204,7 +213,8 @@ async def run(args: argparse.Namespace) -> int:
         nominals = dut_info.nominals
 
         cal = await asyncio.to_thread(CalBoard.connect, args.cal_port)
-        print(f"Calibration board on {cal.port}: {cal.fw_id}")
+        cal_uid = f"{await asyncio.to_thread(cal.unique_id):012X}"
+        print(f"Calibration board on {cal.port}: {cal.fw_id} (uid {cal_uid})")
 
         # Expected +/-FS span per channel, from the flash nominals and the
         # ADC's own PGA readback — the gross-error cross-check.
@@ -233,6 +243,7 @@ async def run(args: argparse.Namespace) -> int:
                 "board_model": dut_info.board_model,
                 "firmware_rev": dut_info.firmware_rev,
                 "cal_board_id": cal.fw_id,
+                "cal_board_uid": cal_uid,
                 "cal_port": cal.port,
                 "exc_mv": args.exc_mv,
                 "csv_path": str(csv_path),
@@ -283,8 +294,17 @@ async def run(args: argparse.Namespace) -> int:
                 return 1
 
             readings = cal_math.final_readings(config_values)
+            temp_calboard_mean = statistics.fmean(seg.temp_c for seg in segments)
             entries = cal_math.build_flash_entries(
-                readings, cal.fw_id, exc_mv=args.exc_mv, now=started
+                readings,
+                cal.fw_id,
+                exc_mv=args.exc_mv,
+                now=started,
+                tool=SCRIPT_VERSION,
+                origin="factory",
+                adc_gains=dut_info.adc_config.gains,
+                temp_dut_c=DUT_TEMP_PLACEHOLDER_C,
+                temp_calboard_c=temp_calboard_mean,
             )
             print("Gates passed. Calibration readings (raw counts, storage order):")
             for dut_ch in range(4):
@@ -395,6 +415,7 @@ def main() -> None:
     gates.add_argument("--pass-tol-counts", type=float, default=200.0)
     gates.add_argument("--zero-tol-counts", type=float, default=200.0)
     gates.add_argument("--span-tol", type=float, default=0.10)
+    gates.add_argument("--max-temp-spread-c", type=float, default=0.2)
     args = parser.parse_args()
 
     try:
