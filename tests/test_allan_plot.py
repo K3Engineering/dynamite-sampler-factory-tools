@@ -95,7 +95,7 @@ def test_capture_for_aborts_on_gap():
 
 def test_capture_for_aborts_on_overflow():
     rec = SimpleNamespace(overflowed=True, missing_count=0, n_samples=0)
-    with pytest.raises(allan_plot.AllanError, match="rate"):
+    with pytest.raises(allan_plot.AllanError, match="provisioned"):
         asyncio.run(allan_plot.capture_for(rec, 30.0, "x"))
 
 
@@ -104,9 +104,36 @@ def test_capture_for_completes_clean_run():
     asyncio.run(allan_plot.capture_for(rec, 0.05, "x"))  # returns, no raise
 
 
+def test_estimate_capacity():
+    # regression: 2 parts x 60 s at 1 kSPS with 2 s guards overflowed the old
+    # windows-only 1.02 estimate (125k actual rows vs 122k provisioned)
+    cap = allan_plot.estimate_capacity(1000, 60.0, 2, 2.0)
+    assert cap == 1000 * (60 * 2 + 2 * 2 + 10) + 64
+    assert cap >= 60020 + 60000 + 2 * 2000 + 1500
+    assert allan_plot.estimate_capacity(1000, 60.0, 1, 0.0) == 1000 * (60 + 10) + 64
+
+
 def test_hms():
     assert allan_plot._hms(5.9) == "0:00:05"
     assert allan_plot._hms(3661) == "1:01:01"
+
+
+def test_stdout_tee(tmp_path):
+    import io
+
+    console = io.StringIO()
+    tee = allan_plot.StdoutTee(console, tmp_path / "r.txt")
+    print("feed running", file=tee)
+    tee.write("\rprogress 12%  ")
+    print("done: 60,020 samples", file=tee)
+    print("valley 7.3±0.6 nV at τ=0.431 s — unicode line", file=tee)
+    tee.close()
+    report = (tmp_path / "r.txt").read_text(encoding="utf-8")
+    assert console.getvalue().count("progress") == 1  # console saw the live line
+    assert "progress" not in report  # the report did not
+    assert "feed running" in report and "done: 60,020 samples" in report
+    assert "τ=0.431" in report  # unicode survives into the report
+    assert tee.isatty() == console.isatty()  # capture_for asks isatty()
 
 
 def test_reduce_excludes_railed_channel(tmp_path):

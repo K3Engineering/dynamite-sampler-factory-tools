@@ -8,8 +8,13 @@ Flow:
      run — Allan math requires a gap-free record.
   3. Per channel: overlapping Allan deviation on an 8-points/octave tau grid,
      converted to nV referred to the AFE input, plotted with conservative
-     1-sigma error bars. PNG is saved next to the CSV; a window is shown
-     unless --no-show.
+     1-sigma error bars, a white-noise reference slope anchored at the 1 ms
+     point (a yardstick, not a fit), and the modeled contribution of any
+     detected narrowband interference lines. Narrowband lines are detected
+     per channel (Hann FFT, peaks > 6x the median bin) and listed in the
+     report. PNG is saved next to the CSV, a .txt copy of the console output
+     (minus the live progress line) alongside; a window is shown unless
+     --no-show.
 
 Modes:
   passive (default): measure whatever is attached (load cells, bench
@@ -61,16 +66,52 @@ from board_calibration import PHASES, check_provisioning
 from calboard_driver import CalBoard, CalBoardError
 from nominal_values import BOARD_MODELS
 
-SCRIPT_VERSION = "allan_plot 1.1"
+SCRIPT_VERSION = "allan_plot 1.2.2"
 
 DEFAULT_CAPTURE_DIR = Path(__file__).resolve().with_name("captures")
 
-# Wait for the relay to settle after shorting before the window opens.
-DEFAULT_GUARD_S = 0.4
+# Wait after shorting before the window opens. The open-input high-gain
+# chain was observed to take up to ~1 s to settle; 2 s guards with 2x margin.
+DEFAULT_GUARD_S = 2.0
+
+# Buffer slack beyond exact accounting, for the feed-startup latency before
+# window 1 (BLE subscribe + first relay command).
+CAPACITY_SLACK_S = 10.0
+
+
+def estimate_capacity(rate, duration, n_parts, guard):
+    """Buffer size for a capture: every streamed sample is buffered, including
+    guard and startup rows outside the analysis windows."""
+    return (
+        int(rate * (duration * n_parts + guard * n_parts + CAPACITY_SLACK_S)) + 64
+    )
 
 
 class AllanError(Exception):
     """The capture or the channel plan is unusable."""
+
+
+class StdoutTee:
+    """stdout duplicator for the .txt report; drops the \r live-progress writes."""
+
+    def __init__(self, stream, path):
+        self.stream = stream
+        self._file = open(path, "w", encoding="utf-8")
+
+    def write(self, s):
+        self.stream.write(s)
+        if not s.startswith("\r"):
+            self._file.write(s)
+
+    def flush(self):
+        self.stream.flush()
+        self._file.flush()
+
+    def isatty(self):
+        return self.stream.isatty()
+
+    def close(self):
+        self._file.close()
 
 
 class AllanRecorder(NotifyCallbackFeeddatas):
@@ -195,7 +236,7 @@ async def capture_for(recorder: AllanRecorder, seconds: float, label: str) -> No
                 print()  # don't leave the error on the progress line
             if recorder.overflowed:
                 raise AllanError(
-                    "more samples than the readback rate predicted — capture untrusted"
+                    "captured more samples than provisioned — capture untrusted"
                 )
             raise AllanError(
                 f"BLE dropped {recorder.missing_count} samples — "
@@ -216,12 +257,14 @@ async def capture_for(recorder: AllanRecorder, seconds: float, label: str) -> No
 
 @dataclass
 class Trace:
-    """One plotted channel: overlapping Allan deviation in nV (AFE input)."""
+    """One plotted channel: Allan deviation in nV (AFE input) + detected lines."""
 
     dut_ch: int
     taus_s: np.ndarray
     adev_nv: np.ndarray
     err_nv: np.ndarray
+    lines: list  # (freq_hz, amplitude_counts) from allan_math.detect_lines
+    nv_per_count: float
 
 
 def reduce_traces(recorder, windows, rate, volts_per_count_ch) -> list[Trace]:
@@ -236,8 +279,18 @@ def reduce_traces(recorder, windows, rate, volts_per_count_ch) -> list[Trace]:
                 print(f"  ch{dut_ch}: pinned at full scale — excluded (unplugged?)")
                 continue
             taus, adev, err = allan_math.overlapping_adev(samples, rate)
-            scale = volts_per_count_ch[dut_ch] * 1e9
-            traces.append(Trace(dut_ch, taus, adev * scale, err * scale))
+            lines = allan_math.detect_lines(samples, rate)
+            nv_per_count = volts_per_count_ch[dut_ch] * 1e9
+            traces.append(
+                Trace(
+                    dut_ch,
+                    taus,
+                    adev * nv_per_count,
+                    err * nv_per_count,
+                    lines,
+                    nv_per_count,
+                )
+            )
     return traces
 
 
@@ -249,7 +302,8 @@ def make_plot(traces, meta_lines, png_path, no_show):
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(9, 6))
-    for t in traces:
+    for i, t in enumerate(traces):
+        color = f"C{i}"
         ax.errorbar(
             t.taus_s,
             t.adev_nv,
@@ -259,10 +313,40 @@ def make_plot(traces, meta_lines, png_path, no_show):
             linewidth=1,
             elinewidth=0.7,
             capsize=2,
+            color=color,
             label=f"ch{t.dut_ch}",
         )
+        # white-noise yardstick: tau^-1/2 through the 1 ms point
+        ax.plot(
+            t.taus_s,
+            t.adev_nv[0] * np.sqrt(t.taus_s[0] / t.taus_s),
+            ":",
+            color=color,
+            alpha=0.6,
+            label=r"white reference ($\propto\tau^{-1/2}$)" if i == 0 else None,
+        )
+        if t.lines:
+            # draw the model only where relevant: a couple periods of the
+            # lowest detected line (its deep nulls beyond that are clutter)
+            t_max = 2.0 / min(f for f, _ in t.lines)
+            mask = t.taus_s <= t_max
+            overlay = allan_math.modeled_adev(
+                [(f, a * t.nv_per_count) for f, a in t.lines], t.taus_s[mask]
+            )
+            ax.plot(
+                t.taus_s[mask],
+                overlay,
+                "--",
+                color=color,
+                alpha=0.6,
+                label="EMI model (detected lines)" if i == 0 else None,
+            )
     ax.set_xscale("log")
     ax.set_yscale("log")
+    # the model nulls dive orders of magnitude below the noise floor; crop
+    min_valley = min(t.adev_nv.min() for t in traces)
+    if min_valley > 0:
+        ax.set_ylim(bottom=min_valley / 10)
     ax.set_xlabel("averaging time τ (s)")
     ax.set_ylabel("Allan deviation (nV) — referred to AFE input")
     ax.grid(True, which="both", ls=":", lw=0.5, alpha=0.6)
@@ -305,117 +389,132 @@ async def run(args: argparse.Namespace) -> int:
             / f"allan_{started:%Y%m%d_%H%M%S}_{safe_mac}.csv"
         )
         png_path = csv_path.with_suffix(".png")
+        report_path = csv_path.with_suffix(".txt")
 
-        capacity = (
-            int(
-                rate * args.duration * (len(channel_sets) if channel_sets else 1) * 1.02
-            )
-            + 64
-        )
-        recorder = AllanRecorder(csv_path, kept_channels, capacity)
-        session = FeedSession(
-            dut.client,
-            callbacks_feeddata=[recorder],
-            device_info={
-                "FirmwareRevision": info.firmware_rev,
-                "ADCConfig": info.adc_config,
-            },
-        )
+        # Console output from here on is also the .txt report.
+        tee = StdoutTee(sys.stdout, report_path)
+        sys.stdout = tee
         try:
-            await session.start()
-            deadline = time.monotonic() + 10.0
-            while recorder.n_samples == 0:
-                if time.monotonic() > deadline:
-                    raise AllanError("no ADC feed data within 10 s of subscribing")
-                await asyncio.sleep(0.05)
-            print(f"Feed running at {rate} SPS. Capture -> {csv_path}")
+            n_parts = len(channel_sets) if channel_sets else 1
+            capacity = estimate_capacity(
+                rate, args.duration, n_parts, args.guard if channel_sets else 0.0
+            )
+            recorder = AllanRecorder(csv_path, kept_channels, capacity)
+            session = FeedSession(
+                dut.client,
+                callbacks_feeddata=[recorder],
+                device_info={
+                    "FirmwareRevision": info.firmware_rev,
+                    "ADCConfig": info.adc_config,
+                },
+            )
+            try:
+                await session.start()
+                deadline = time.monotonic() + 10.0
+                while recorder.n_samples == 0:
+                    if time.monotonic() > deadline:
+                        raise AllanError("no ADC feed data within 10 s of subscribing")
+                    await asyncio.sleep(0.05)
+                print(f"Feed running at {rate} SPS. Capture -> {csv_path}")
 
-            windows = []
-            if channel_sets is None:
-                print(
-                    f"capturing {args.duration:g} s on ch "
-                    f"{','.join(map(str, kept_channels))} (passive)"
-                )
-                await capture_for(
-                    recorder,
-                    args.duration,
-                    f"ch {','.join(map(str, kept_channels))}",
-                )
-                print(f"  done: {recorder.n_samples:,} samples")
-                windows.append(
-                    {
-                        "i0": 0,
-                        "i1": recorder.n_samples,
-                        "dut_channels": kept_channels,
-                        "temp_c": None,
-                    }
-                )
-            else:
-                for set_idx, board_chs in enumerate(channel_sets):
-                    await asyncio.to_thread(cal.set_channels, {c: 0 for c in board_chs})
-                    await asyncio.sleep(args.guard)
-                    i0 = recorder.n_samples
-                    dut_chs = tuple(c - 1 for c in board_chs)
+                windows = []
+                if channel_sets is None:
                     print(
-                        f"part {set_idx + 1}/{len(channel_sets)}: "
-                        f"ch {','.join(map(str, dut_chs))} shorted, "
-                        f"capturing {args.duration:g} s"
+                        f"capturing {args.duration:g} s on ch "
+                        f"{','.join(map(str, kept_channels))} (passive)"
                     )
                     await capture_for(
                         recorder,
                         args.duration,
-                        f"ch {','.join(map(str, dut_chs))}",
+                        f"ch {','.join(map(str, kept_channels))}",
                     )
-                    i1 = recorder.n_samples
-                    temp_c = await asyncio.to_thread(cal.read_temperature)
-                    print(f"  done: {i1 - i0:,} samples, cal board {temp_c:.2f} C")
+                    print(f"  done: {recorder.n_samples:,} samples")
                     windows.append(
                         {
-                            "i0": i0,
-                            "i1": i1,
-                            "dut_channels": dut_chs,
-                            "temp_c": temp_c,
+                            "i0": 0,
+                            "i1": recorder.n_samples,
+                            "dut_channels": kept_channels,
+                            "temp_c": None,
                         }
                     )
-            await session.stop()
+                else:
+                    for set_idx, board_chs in enumerate(channel_sets):
+                        await asyncio.to_thread(
+                            cal.set_channels, {c: 0 for c in board_chs}
+                        )
+                        await asyncio.sleep(args.guard)
+                        i0 = recorder.n_samples
+                        dut_chs = tuple(c - 1 for c in board_chs)
+                        print(
+                            f"part {set_idx + 1}/{len(channel_sets)}: "
+                            f"ch {','.join(map(str, dut_chs))} shorted, "
+                            f"capturing {args.duration:g} s"
+                        )
+                        await capture_for(
+                            recorder,
+                            args.duration,
+                            f"ch {','.join(map(str, dut_chs))}",
+                        )
+                        i1 = recorder.n_samples
+                        temp_c = await asyncio.to_thread(cal.read_temperature)
+                        print(f"  done: {i1 - i0:,} samples, cal board {temp_c:.2f} C")
+                        windows.append(
+                            {
+                                "i0": i0,
+                                "i1": i1,
+                                "dut_channels": dut_chs,
+                                "temp_c": temp_c,
+                            }
+                        )
+                await session.stop()
+            finally:
+                await session.stop()  # idempotent
+                if cal is not None:
+                    cal.close()
+
+            traces = reduce_traces(recorder, windows, rate, volts_per_count_ch)
+            if not traces:
+                raise AllanError("nothing left to plot — every channel railed")
+
+            for t in traces:
+                i = int(np.argmin(t.adev_nv))
+                print(
+                    f"ch{t.dut_ch}: {t.adev_nv[0]:.0f} nV at 1 sample; "
+                    f"valley {t.adev_nv[i]:.1f}±{t.err_nv[i]:.1f} nV "
+                    f"at τ={t.taus_s[i]:.3g} s"
+                )
+            for t in traces:
+                print(allan_math.format_lines(t.lines, t.nv_per_count, f"ch{t.dut_ch}"))
+
+            if channel_sets is None:
+                mode_line = f"passive, {args.duration:g} s"
+            else:
+                temps = ", ".join(f"{w['temp_c']:.2f} C" for w in windows)
+                mode_line = (
+                    f"cal-board shorts ({cal.fw_id} uid {cal_uid}), "
+                    f"{args.duration:g} s/part, board temp: {temps}"
+                )
+            meta_lines = [
+                (
+                    f"Allan deviation — {dut.device_name} {dut.client.address} — "
+                    f"{info.board_model} @ {rate} SPS"
+                ),
+                (
+                    f"{started:%Y-%m-%d %H:%M}Z · {mode_line} · {SCRIPT_VERSION} · "
+                    f"{info.firmware_rev}"
+                ),
+            ]
+            make_plot(traces, meta_lines, png_path, args.no_show)
+            print(f"Plot saved to {png_path}")
+            return 0
+        except (AllanError, KvsError, CalBoardError) as e:
+            # keep the cause in the report; main() will not reprint it
+            e.already_reported = True
+            print(f"error: {e}")
+            raise
         finally:
-            await session.stop()  # idempotent
-            if cal is not None:
-                cal.close()
-
-        traces = reduce_traces(recorder, windows, rate, volts_per_count_ch)
-        if not traces:
-            raise AllanError("nothing left to plot — every channel railed")
-
-        for t in traces:
-            i = int(np.argmin(t.adev_nv))
-            print(
-                f"ch{t.dut_ch}: {t.adev_nv[0]:.0f} nV at 1 sample; "
-                f"valley {t.adev_nv[i]:.1f}±{t.err_nv[i]:.1f} nV "
-                f"at τ={t.taus_s[i]:.3g} s"
-            )
-
-        if channel_sets is None:
-            mode_line = f"passive, {args.duration:g} s"
-        else:
-            temps = ", ".join(f"{w['temp_c']:.2f} C" for w in windows)
-            mode_line = (
-                f"cal-board shorts ({cal.fw_id} uid {cal_uid}), "
-                f"{args.duration:g} s/part, board temp: {temps}"
-            )
-        meta_lines = [
-            (
-                f"Allan deviation — {dut.device_name} {dut.client.address} — "
-                f"{info.board_model} @ {rate} SPS"
-            ),
-            (
-                f"{started:%Y-%m-%d %H:%M}Z · {mode_line} · {SCRIPT_VERSION} · "
-                f"{info.firmware_rev}"
-            ),
-        ]
-        make_plot(traces, meta_lines, png_path, args.no_show)
-        print(f"Plot saved to {png_path}")
-        return 0
+            sys.stdout = tee.stream
+            tee.close()
 
 
 def main() -> None:
@@ -487,7 +586,8 @@ def main() -> None:
     try:
         sys.exit(asyncio.run(run(args)))
     except (AllanError, KvsError, CalBoardError) as e:
-        print(f"error: {e}", file=sys.stderr)
+        if not getattr(e, "already_reported", False):
+            print(f"error: {e}", file=sys.stderr)
         sys.exit(2)
 
 

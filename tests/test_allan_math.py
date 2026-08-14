@@ -67,3 +67,48 @@ def test_volts_per_count():
     v = allan_math.volts_per_count(1.2, 101.0, 1)
     assert abs(v - 1.2 / (2**23 * 101.0)) < 1e-15
     assert 1.4e-9 < v < 1.5e-9  # ~1.42 nV/count on v700P
+
+
+FS = 1000.0
+
+
+def test_detect_lines_finds_tone():
+    t = np.arange(54000) / FS
+    x = 40.0 * np.sin(2 * np.pi * 53.333 * t) + 15.0 * np.sin(2 * np.pi * 106.667 * t)
+    x += np.random.default_rng(0).normal(0.0, 50.0, t.size)
+    lines = allan_math.detect_lines(x, FS)
+    freqs = [f for f, _ in lines]
+    assert any(abs(f - 53.333) < 0.1 for f in freqs)
+    assert any(abs(f - 106.667) < 0.1 for f in freqs)
+    amp = next(a for f, a in lines if abs(f - 53.333) < 0.1)
+    assert abs(amp / 40.0 - 1.0) < 0.2
+    groups = allan_math.fold_harmonics(lines)
+    assert len(groups) == 1
+    assert [k for k, _, _ in groups[0][2]] == [2]
+
+
+def test_detect_lines_white_noise_finds_none():
+    x = np.random.default_rng(1).normal(0.0, 50.0, 54000)
+    assert allan_math.detect_lines(x, FS) == []
+
+
+def test_line_adev_null_and_peak():
+    taus = np.array([1 / (2 * 53.333), 1 / 53.333, 2 / 53.333])
+    ad = allan_math.line_adev(53.333, 40.0, taus)
+    assert abs(ad[0] / (2 * 40.0 / math.pi) - 1.0) < 0.01  # peak ~0.637*A
+    assert abs(ad[1]) < 1e-10  # first null at one period
+    assert abs(ad[2]) < 1e-10
+
+
+def test_modeled_adev_quadrature():
+    taus = np.array([0.001, 0.01, 0.1])
+    one = allan_math.line_adev(53.333, 30.0, taus)
+    assert np.allclose(allan_math.modeled_adev([(53.333, 30.0)], taus), one)
+    two = allan_math.modeled_adev([(53.333, 30.0), (200.0, 30.0)], taus)
+    assert np.all(two >= one)
+
+
+def test_format_lines():
+    assert "no narrowband" in allan_math.format_lines([], 1.42, "ch0")
+    s = allan_math.format_lines([(53.333, 32.0), (106.6, 20.0)], 1.42, "ch0")
+    assert "53.3 Hz" in s and "45 nV" in s and "2x" in s
