@@ -151,4 +151,31 @@ def test_reduce_excludes_railed_channel(tmp_path):
     traces = allan_plot.reduce_traces(rec, windows, 1000, vpc)
     assert [t.dut_ch for t in traces] == [0]
     assert traces[0].adev_nv[0] > 0
+    assert traces[0].spec_hz.size == traces[0].spec_nv.size > 10
+    assert traces[0].asd_hz.size == traces[0].asd_nv.size > 10
+    rec.cleanup()
+
+
+def test_make_plots_writes_three_pngs(tmp_path):
+    rec = allan_plot.AllanRecorder(
+        tmp_path / "cap.csv", keep_channels=(0, 1), capacity=2048
+    )
+    rec.setup({})
+    rng = np.random.default_rng(0)
+    t = np.arange(2048) / 1000.0
+    ch0 = (rng.normal(0, 50, 2048) + 40.0 * np.sin(2 * np.pi * 53.333 * t)).astype(int)
+    ch1 = rng.normal(0, 50, 2048).astype(int)
+    header, feed = make_packet(0, list(zip(ch0, ch1, ch1, ch1)))
+    rec.callback(header, feed, 0)
+    windows = [{"i0": 0, "i1": rec.n_samples, "dut_channels": (0, 1), "temp_c": None}]
+    vpc = [allan_plot.allan_math.volts_per_count(1.2, 101.0, 1)] * 4
+    traces = allan_plot.reduce_traces(rec, windows, 1000, vpc)
+    png = tmp_path / "allan.png"
+    paths = allan_plot.make_plots(traces, ["Allan deviation — test", "meta"], png, True)
+    assert paths == (
+        png,
+        tmp_path / "allan_spectrum.png",
+        tmp_path / "allan_psd.png",
+    )
+    assert all(p.is_file() and p.stat().st_size > 0 for p in paths)
     rec.cleanup()

@@ -64,77 +64,99 @@ def overlapping_adev(x, sample_rate, points_per_octave=POINTS_PER_OCTAVE):
     return np.array(taus), np.array(adevs), np.array(errs)
 
 
-def detect_lines(x, sample_rate, ratio=6.0, f_min=3.0, max_lines=12):
-    """Narrowband interference lines in a count series [(freq_hz, amplitude)].
+def amplitude_spectrum(x, sample_rate):
+    """Hann-windowed single-sided peak-amplitude spectrum (freqs_hz, amp).
 
-    Hann-windowed FFT; a line is a peak above `ratio` x the median bin
-    amplitude (greedy max-pick, +-4 bins blanked for the Hann mainlobe).
-    Amplitudes are peak counts. Bins below f_min are excluded — that content
-    is drift/flicker, not a line.
+    Amplitude is in the units of x (counts). Same scaling as detect_peaks.
     """
     x = np.ascontiguousarray(x, dtype=np.float64)
     x = x - x.mean()
     n = x.size
     spec = np.abs(np.fft.rfft(x * np.hanning(n))) * (4.0 / n)
     freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
-    spec[freqs < f_min] = 0.0
-    floor = np.median(spec[freqs >= f_min])
+    return freqs, spec
+
+
+def _welch_nperseg(n):
+    cap = min(n, 4096)
+    floor = min(n, 256)
+    target = min(cap, max(floor, n // 8))
+    return min(1 << int(round(math.log2(max(target, 8)))), n)
+
+
+def noise_asd(x, sample_rate, nperseg=None):
+    """One-sided amplitude spectral density via Welch (Hann, 50% overlap).
+
+    Returns (freqs_hz, asd) in units of x / sqrt(Hz).
+    """
+    x = np.ascontiguousarray(x, dtype=np.float64)
+    x = x - x.mean()
+    n = x.size
+    if nperseg is None:
+        nperseg = _welch_nperseg(n)
+    hop = max(1, nperseg // 2)
+    w = np.hanning(nperseg)
+    w_ss = float(w @ w)
+    acc = None
+    nseg = 0
+    for start in range(0, n - nperseg + 1, hop):
+        X = np.fft.rfft(x[start : start + nperseg] * w)
+        p = (X.real**2 + X.imag**2) / (sample_rate * w_ss)
+        acc = p if acc is None else acc + p
+        nseg += 1
+    acc /= nseg
+    acc[1:] *= 2.0
+    if nperseg % 2 == 0:
+        acc[-1] *= 0.5
+    return np.fft.rfftfreq(nperseg, 1.0 / sample_rate), np.sqrt(acc)
+
+
+def detect_peaks(x, sample_rate, ratio=6.0, f_min=3.0, max_peaks=12):
+    """Narrowband peaks in a count series [(freq_hz, amplitude)].
+
+    Hann-windowed FFT; a peak is above `ratio` x the median bin
+    amplitude (greedy max-pick, +-4 bins blanked for the Hann mainlobe).
+    Amplitudes are peak counts. Bins below f_min are excluded — that content
+    is drift/flicker, not a tone.
+    """
+    return pick_peaks(*amplitude_spectrum(x, sample_rate), ratio, f_min, max_peaks)
+
+
+def pick_peaks(freqs, spec, ratio=6.0, f_min=3.0, max_peaks=12):
+    """Peak-pick a precomputed amplitude spectrum. See detect_peaks."""
     work = spec.copy()
-    lines = []
-    for _ in range(max_lines):
+    work[freqs < f_min] = 0.0
+    floor = np.median(spec[freqs >= f_min])
+    peaks = []
+    for _ in range(max_peaks):
         k = int(np.argmax(work))
         if work[k] <= ratio * floor or work[k] == 0.0:
             break
-        lines.append((float(freqs[k]), float(spec[k])))
+        peaks.append((float(freqs[k]), float(spec[k])))
         work[max(0, k - 4) : k + 5] = 0.0
-    return sorted(lines)
+    return sorted(peaks)
 
 
-def fold_harmonics(lines, tol=0.015, max_harmonic=6):
-    """Group detected lines into (fund_freq, fund_amp, [(multiple, freq, amp)])."""
-    groups = []
-    used = [False] * len(lines)
-    for i, (f0, a0) in enumerate(lines):
-        if used[i]:
-            continue
-        harm = []
-        for j in range(i + 1, len(lines)):
-            if used[j]:
-                continue
-            f, a = lines[j]
-            for k in range(2, max_harmonic + 1):
-                if abs(f / (k * f0) - 1.0) < tol:
-                    harm.append((k, f, a))
-                    used[j] = True
-                    break
-        groups.append((f0, a0, harm))
-    return groups
+def format_peaks(peaks, nv_per_count, prefix):
+    """One-line report summary of the detected narrowband peaks."""
+    if not peaks:
+        return f"{prefix}: no narrowband peaks detected"
+    parts = [
+        f"{f:.1f} Hz: {a:.0f} counts ({a * nv_per_count:.0f} nV)" for f, a in peaks
+    ]
+    return f"{prefix}: narrowband peaks: " + "; ".join(parts)
 
 
-def format_lines(lines, nv_per_count, prefix):
-    """One-line report summary of the detected narrowband lines."""
-    if not lines:
-        return f"{prefix}: no narrowband lines detected"
-    parts = []
-    for f0, a0, harm in fold_harmonics(lines):
-        s = f"{f0:.1f} Hz: {a0:.0f} counts ({a0 * nv_per_count:.0f} nV)"
-        if harm:
-            s += " + harmonics " + "/".join(f"{k}x" for k, _, _ in harm)
-        parts.append(s)
-    return f"{prefix}: narrowband lines: " + "; ".join(parts)
-
-
-def line_adev(freq, amp, taus_s):
+def peak_adev(freq, amp, taus_s):
     """ADEV of a sinusoid of amplitude `amp` at `freq`: A sin^2(pi f t)/(pi f t).
-    Nulls at tau = k/f — periodic interference vanishes from full-period
-    averages by symmetry."""
+    Nulls at tau = k/f — a full-period average of a tone is zero by symmetry."""
     x = np.pi * freq * np.asarray(taus_s, dtype=np.float64)
     return amp * np.sin(x) ** 2 / np.maximum(x, 1e-300)
 
 
-def modeled_adev(lines, taus_s):
-    """Quadrature-summed ADEV contribution of all detected lines."""
+def narrowband_adev(peaks, taus_s):
+    """Quadrature-summed ADEV contribution of all detected peaks."""
     total = np.zeros(len(taus_s))
-    for f, a in lines:
-        total += line_adev(f, a, taus_s) ** 2
+    for f, a in peaks:
+        total += peak_adev(f, a, taus_s) ** 2
     return np.sqrt(total)

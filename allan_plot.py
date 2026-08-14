@@ -6,15 +6,13 @@ Flow:
      Optionally, connect to the calibration board and set up shorts
   2. Record a contiguous capture to CSV. A single dropped sample aborts the
      run — Allan math requires a gap-free record.
-  3. Per channel: overlapping Allan deviation on an 8-points/octave tau grid,
-     converted to nV referred to the AFE input, plotted with conservative
-     1-sigma error bars, a white-noise reference slope anchored at the 1 ms
-     point (a yardstick, not a fit), and the modeled contribution of any
-     detected narrowband interference lines. Narrowband lines are detected
-     per channel (Hann FFT, peaks > 6x the median bin) and listed in the
-     report. PNG is saved next to the CSV, a .txt copy of the console output
-     (minus the live progress line) alongside; a window is shown unless
-     --no-show.
+     3. Per channel: overlapping Allan deviation on an 8-points/octave tau grid,
+     converted to nV referred to the AFE input, plus a Hann amplitude
+     spectrum and a Welch amplitude spectral density. Narrowband peaks
+     (Hann FFT, peaks > 6x the median bin) are listed in the report and
+     marked on the spectrum. Three PNGs (ADEV, per-channel spectrum, per-channel PSD)
+     are saved next to the CSV, a .txt copy of the console output (minus
+     the live progress line) alongside; windows are shown unless --no-show.
 
 Modes:
   passive (default): measure whatever is attached (load cells, bench
@@ -255,16 +253,34 @@ async def capture_for(recorder: AllanRecorder, seconds: float, label: str) -> No
         print()
 
 
+SPEC_PLOT_BINS = 16384
+
+
+def _peak_hold_downsample(freqs, spec, n_out=SPEC_PLOT_BINS):
+    n = freqs.size
+    if n <= n_out:
+        return freqs, spec
+    edges = np.linspace(0, n, n_out + 1).astype(int)
+    idx = np.array(
+        [edges[i] + int(np.argmax(spec[edges[i] : edges[i + 1]])) for i in range(n_out)]
+    )
+    return freqs[idx], spec[idx]
+
+
 @dataclass
 class Trace:
-    """One plotted channel: Allan deviation in nV (AFE input) + detected lines."""
+    """One plotted channel: ADEV, spectrum, ASD — all nV referred to AFE input."""
 
     dut_ch: int
     taus_s: np.ndarray
     adev_nv: np.ndarray
     err_nv: np.ndarray
-    lines: list  # (freq_hz, amplitude_counts) from allan_math.detect_lines
+    peaks: list  # (freq_hz, amplitude_counts) from allan_math.pick_peaks
     nv_per_count: float
+    spec_hz: np.ndarray
+    spec_nv: np.ndarray
+    asd_hz: np.ndarray
+    asd_nv: np.ndarray
 
 
 def reduce_traces(recorder, windows, rate, volts_per_count_ch) -> list[Trace]:
@@ -279,7 +295,10 @@ def reduce_traces(recorder, windows, rate, volts_per_count_ch) -> list[Trace]:
                 print(f"  ch{dut_ch}: pinned at full scale — excluded (unplugged?)")
                 continue
             taus, adev, err = allan_math.overlapping_adev(samples, rate)
-            lines = allan_math.detect_lines(samples, rate)
+            spec_hz, spec = allan_math.amplitude_spectrum(samples, rate)
+            peaks = allan_math.pick_peaks(spec_hz, spec)
+            spec_hz, spec = _peak_hold_downsample(spec_hz, spec)
+            asd_hz, asd = allan_math.noise_asd(samples, rate)
             nv_per_count = volts_per_count_ch[dut_ch] * 1e9
             traces.append(
                 Trace(
@@ -287,23 +306,26 @@ def reduce_traces(recorder, windows, rate, volts_per_count_ch) -> list[Trace]:
                     taus,
                     adev * nv_per_count,
                     err * nv_per_count,
-                    lines,
+                    peaks,
                     nv_per_count,
+                    spec_hz,
+                    spec * nv_per_count,
+                    asd_hz,
+                    asd * nv_per_count,
                 )
             )
     return traces
 
 
-def make_plot(traces, meta_lines, png_path, no_show):
-    import matplotlib
+def _annotate_footer(fig, meta_lines):
+    if len(meta_lines) > 1:
+        fig.text(0.01, 0.012, "\n".join(meta_lines[1:]), fontsize=8)
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
 
-    if no_show:
-        matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
 
+def _plot_adev(plt, traces, meta_lines):
     fig, ax = plt.subplots(figsize=(9, 6))
     for i, t in enumerate(traces):
-        color = f"C{i}"
         ax.errorbar(
             t.taus_s,
             t.adev_nv,
@@ -313,52 +335,83 @@ def make_plot(traces, meta_lines, png_path, no_show):
             linewidth=1,
             elinewidth=0.7,
             capsize=2,
-            color=color,
+            color=f"C{i}",
             label=f"ch{t.dut_ch}",
         )
-        # white-noise yardstick: tau^-1/2 through the 1 ms point
-        ax.plot(
-            t.taus_s,
-            t.adev_nv[0] * np.sqrt(t.taus_s[0] / t.taus_s),
-            ":",
-            color=color,
-            alpha=0.6,
-            label=r"white reference ($\propto\tau^{-1/2}$)" if i == 0 else None,
-        )
-        if t.lines:
-            # draw the model only where relevant: a couple periods of the
-            # lowest detected line (its deep nulls beyond that are clutter)
-            t_max = 2.0 / min(f for f, _ in t.lines)
-            mask = t.taus_s <= t_max
-            overlay = allan_math.modeled_adev(
-                [(f, a * t.nv_per_count) for f, a in t.lines], t.taus_s[mask]
-            )
-            ax.plot(
-                t.taus_s[mask],
-                overlay,
-                "--",
-                color=color,
-                alpha=0.6,
-                label="EMI model (detected lines)" if i == 0 else None,
-            )
     ax.set_xscale("log")
     ax.set_yscale("log")
-    # the model nulls dive orders of magnitude below the noise floor; crop
-    min_valley = min(t.adev_nv.min() for t in traces)
-    if min_valley > 0:
-        ax.set_ylim(bottom=min_valley / 10)
     ax.set_xlabel("averaging time τ (s)")
     ax.set_ylabel("Allan deviation (nV) — referred to AFE input")
     ax.grid(True, which="both", ls=":", lw=0.5, alpha=0.6)
     ax.legend()
     ax.set_title(meta_lines[0], fontsize=10)
-    if len(meta_lines) > 1:
-        fig.text(0.01, 0.012, "\n".join(meta_lines[1:]), fontsize=8)
-    fig.tight_layout(rect=(0, 0.05, 1, 1))
-    fig.savefig(png_path, dpi=150)
+    _annotate_footer(fig, meta_lines)
+    return fig
+
+
+def _plot_spectrum(plt, traces, meta_lines):
+    n = len(traces)
+    fig, axes = plt.subplots(
+        n, 1, figsize=(9, 2.2 * n + 1.4), sharex=True, squeeze=False
+    )
+    for i, (ax, t) in enumerate(zip(axes[:, 0], traces)):
+        color = f"C{i}"
+        ax.semilogy(t.spec_hz, np.maximum(t.spec_nv, 1e-30), color=color, lw=0.7)
+        if t.peaks:
+            pf = [f for f, _ in t.peaks]
+            pa = [max(a * t.nv_per_count, 1e-30) for f, a in t.peaks]
+            ax.plot(pf, pa, "o", ms=4, color=color)
+        ax.set_ylabel(f"ch{t.dut_ch} (nV)")
+        ax.grid(True, which="both", ls=":", lw=0.5, alpha=0.6)
+    axes[-1, 0].set_xlabel("frequency (Hz)")
+    fig.suptitle(
+        meta_lines[0].replace("Allan deviation", "Amplitude spectrum", 1),
+        fontsize=10,
+    )
+    _annotate_footer(fig, meta_lines)
+    return fig
+
+
+def _plot_psd(plt, traces, meta_lines):
+    n = len(traces)
+    fig, axes = plt.subplots(
+        n, 1, figsize=(9, 2.2 * n + 1.4), sharex=True, squeeze=False
+    )
+    for i, (ax, t) in enumerate(zip(axes[:, 0], traces)):
+        mask = t.asd_hz > 0
+        ax.loglog(
+            t.asd_hz[mask],
+            np.maximum(t.asd_nv[mask], 1e-30),
+            color=f"C{i}",
+            lw=0.9,
+        )
+        ax.set_ylabel(f"ch{t.dut_ch}\n(nV/√Hz)")
+        ax.grid(True, which="both", ls=":", lw=0.5, alpha=0.6)
+    axes[-1, 0].set_xlabel("frequency (Hz)")
+    fig.suptitle(
+        meta_lines[0].replace("Allan deviation", "Noise density", 1),
+        fontsize=10,
+    )
+    _annotate_footer(fig, meta_lines)
+    return fig
+
+
+def make_plots(traces, meta_lines, png_path, no_show):
+    import matplotlib
+
+    if no_show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    spec_path = png_path.with_name(png_path.stem + "_spectrum.png")
+    psd_path = png_path.with_name(png_path.stem + "_psd.png")
+    _plot_adev(plt, traces, meta_lines).savefig(png_path, dpi=150)
+    _plot_spectrum(plt, traces, meta_lines).savefig(spec_path, dpi=150)
+    _plot_psd(plt, traces, meta_lines).savefig(psd_path, dpi=150)
     if not no_show:
         plt.show()
-    plt.close(fig)
+    plt.close("all")
+    return png_path, spec_path, psd_path
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -484,7 +537,7 @@ async def run(args: argparse.Namespace) -> int:
                     f"at τ={t.taus_s[i]:.3g} s"
                 )
             for t in traces:
-                print(allan_math.format_lines(t.lines, t.nv_per_count, f"ch{t.dut_ch}"))
+                print(allan_math.format_peaks(t.peaks, t.nv_per_count, f"ch{t.dut_ch}"))
 
             if channel_sets is None:
                 mode_line = f"passive, {args.duration:g} s"
@@ -504,8 +557,12 @@ async def run(args: argparse.Namespace) -> int:
                     f"{info.firmware_rev}"
                 ),
             ]
-            make_plot(traces, meta_lines, png_path, args.no_show)
-            print(f"Plot saved to {png_path}")
+            adev_path, spec_path, psd_path = make_plots(
+                traces, meta_lines, png_path, args.no_show
+            )
+            print(f"Plots saved to {adev_path}")
+            print(f"             {spec_path}")
+            print(f"             {psd_path}")
             return 0
         except (AllanError, KvsError, CalBoardError) as e:
             # keep the cause in the report; main() will not reprint it
