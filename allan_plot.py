@@ -16,11 +16,11 @@ Modes:
       shorts). --channels selects DUT channels (default: all four).
   --use-calboard: the calibration board dead-shorts the selected inputs
       (relay 0 position), giving the analog chain's noise floor. At most one
-      channel per bridge, so shorting all four takes two phases (board
+      channel per bridge, so shorting all four takes two parts (board
       channels 1+3, then 2+4) and roughly twice --duration of wall time;
-      --duration applies per phase. --calboard-channels (DUT numbering)
-      restricts the set to a single phase. The board's TMP118 temperature is
-      read at the end of each phase.
+      --duration applies per part. --calboard-channels (DUT numbering)
+      restricts the set to a single part. The board's TMP118 temperature is
+      read at the end of each part.
 
 Common commands:
   # LCs attached, all channels, default 60 s:
@@ -61,7 +61,7 @@ from board_calibration import PHASES, check_provisioning
 from calboard_driver import CalBoard, CalBoardError
 from nominal_values import BOARD_MODELS
 
-SCRIPT_VERSION = "allan_plot 1.0"
+SCRIPT_VERSION = "allan_plot 1.1"
 
 DEFAULT_CAPTURE_DIR = Path(__file__).resolve().with_name("captures")
 
@@ -150,10 +150,10 @@ def channel_list_arg(s: str) -> tuple:
 
 
 def plan_capture(args) -> tuple[list | None, tuple]:
-    """(phase plan in board channels, kept DUT channels) from the flags.
+    """(channel sets in board channels, kept DUT channels) from the flags.
 
-    phases is None in passive mode. Board channel = DUT channel + 1 (fixture
-    wiring, as in board_calibration).
+    channel sets is None in passive mode. Board channel = DUT channel + 1
+    (fixture wiring, as in board_calibration).
     """
     if args.calboard_channels is not None and not args.use_calboard:
         raise AllanError("--calboard-channels requires --use-calboard")
@@ -166,7 +166,7 @@ def plan_capture(args) -> tuple[list | None, tuple]:
     if args.calboard_channels is None:
         return list(PHASES), (0, 1, 2, 3)
     board = tuple(c + 1 for c in args.calboard_channels)
-    # Bridges are {1,2} and {3,4}: at most one channel per bridge per phase.
+    # Bridges are {1,2} and {3,4}: at most one channel per bridge at a time.
     if sum(c <= 2 for c in board) > 1 or sum(c >= 3 for c in board) > 1:
         raise AllanError(
             f"calboard set {board} puts two channels on one bridge "
@@ -175,20 +175,43 @@ def plan_capture(args) -> tuple[list | None, tuple]:
     return [board], args.calboard_channels
 
 
-async def capture_for(recorder: AllanRecorder, seconds: float) -> None:
-    """Stream for the given time; bail out the moment the record is gapped."""
+def _hms(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}"
+
+
+async def capture_for(recorder: AllanRecorder, seconds: float, label: str) -> None:
+    """Stream for the given time; bail out the moment the record is gapped.
+
+    On a terminal, shows a live one-line progress report; when stdout is a
+    file/pipe, the capture start/done prints are the log instead.
+    """
+    interactive = sys.stdout.isatty()
+    start = recorder.n_samples
     deadline = time.monotonic() + seconds
     while (remaining := deadline - time.monotonic()) > 0:
-        if recorder.overflowed:
-            raise AllanError(
-                "more samples than the readback rate predicted — capture untrusted"
-            )
-        if recorder.missing_count:
+        if recorder.overflowed or recorder.missing_count:
+            if interactive:
+                print()  # don't leave the error on the progress line
+            if recorder.overflowed:
+                raise AllanError(
+                    "more samples than the readback rate predicted — capture untrusted"
+                )
             raise AllanError(
                 f"BLE dropped {recorder.missing_count} samples — "
                 "Allan math needs a gap-free record"
             )
+        if interactive:
+            n = recorder.n_samples - start
+            print(
+                f"\r{label}: {_hms(seconds - remaining)}/{_hms(seconds)} — "
+                f"{n:,} samples  ",
+                end="",
+                flush=True,
+            )
         await asyncio.sleep(min(1.0, remaining))
+    if interactive:
+        print()
 
 
 @dataclass
@@ -255,7 +278,7 @@ def make_plot(traces, meta_lines, png_path, no_show):
 
 
 async def run(args: argparse.Namespace) -> int:
-    phases, kept_channels = plan_capture(args)
+    channel_sets, kept_channels = plan_capture(args)
 
     async with await KvsClient.connect(args.address) as dut:
         info = await check_provisioning(dut, args.board)
@@ -284,7 +307,10 @@ async def run(args: argparse.Namespace) -> int:
         png_path = csv_path.with_suffix(".png")
 
         capacity = (
-            int(rate * args.duration * (len(phases) if phases else 1) * 1.02) + 64
+            int(
+                rate * args.duration * (len(channel_sets) if channel_sets else 1) * 1.02
+            )
+            + 64
         )
         recorder = AllanRecorder(csv_path, kept_channels, capacity)
         session = FeedSession(
@@ -305,11 +331,17 @@ async def run(args: argparse.Namespace) -> int:
             print(f"Feed running at {rate} SPS. Capture -> {csv_path}")
 
             windows = []
-            if phases is None:
+            if channel_sets is None:
                 print(
-                    f"Passive capture on channels {kept_channels}: {args.duration:g} s"
+                    f"capturing {args.duration:g} s on ch "
+                    f"{','.join(map(str, kept_channels))} (passive)"
                 )
-                await capture_for(recorder, args.duration)
+                await capture_for(
+                    recorder,
+                    args.duration,
+                    f"ch {','.join(map(str, kept_channels))}",
+                )
+                print(f"  done: {recorder.n_samples:,} samples")
                 windows.append(
                     {
                         "i0": 0,
@@ -319,19 +351,24 @@ async def run(args: argparse.Namespace) -> int:
                     }
                 )
             else:
-                for phase_idx, board_chs in enumerate(phases):
+                for set_idx, board_chs in enumerate(channel_sets):
                     await asyncio.to_thread(cal.set_channels, {c: 0 for c in board_chs})
                     await asyncio.sleep(args.guard)
                     i0 = recorder.n_samples
                     dut_chs = tuple(c - 1 for c in board_chs)
                     print(
-                        f"phase {phase_idx}: DUT ch{dut_chs} shorted, "
+                        f"part {set_idx + 1}/{len(channel_sets)}: "
+                        f"ch {','.join(map(str, dut_chs))} shorted, "
                         f"capturing {args.duration:g} s"
                     )
-                    await capture_for(recorder, args.duration)
+                    await capture_for(
+                        recorder,
+                        args.duration,
+                        f"ch {','.join(map(str, dut_chs))}",
+                    )
                     i1 = recorder.n_samples
                     temp_c = await asyncio.to_thread(cal.read_temperature)
-                    print(f"  ({i1 - i0} samples, {temp_c:.2f} C)")
+                    print(f"  done: {i1 - i0:,} samples, cal board {temp_c:.2f} C")
                     windows.append(
                         {
                             "i0": i0,
@@ -358,13 +395,13 @@ async def run(args: argparse.Namespace) -> int:
                 f"at τ={t.taus_s[i]:.3g} s"
             )
 
-        if phases is None:
+        if channel_sets is None:
             mode_line = f"passive, {args.duration:g} s"
         else:
             temps = ", ".join(f"{w['temp_c']:.2f} C" for w in windows)
             mode_line = (
                 f"cal-board shorts ({cal.fw_id} uid {cal_uid}), "
-                f"{args.duration:g} s/phase, board temp: {temps}"
+                f"{args.duration:g} s/part, board temp: {temps}"
             )
         meta_lines = [
             (
@@ -403,7 +440,7 @@ def main() -> None:
         "--duration",
         type=float,
         default=60.0,
-        help="capture length in seconds (per phase with --use-calboard; "
+        help="capture length in seconds (per part with --use-calboard; "
         "default: %(default)s)",
     )
     parser.add_argument(
@@ -422,7 +459,7 @@ def main() -> None:
         "--calboard-channels",
         type=channel_list_arg,
         help="DUT channels to short, comma list 0-3, at most one per bridge "
-        "(default with --use-calboard: all four, in two phases)",
+        "(default with --use-calboard: all four, in two parts)",
     )
     parser.add_argument(
         "--cal-port",

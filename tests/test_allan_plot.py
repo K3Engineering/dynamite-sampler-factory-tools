@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import numpy as np
@@ -17,28 +18,28 @@ def args(**kw):
 
 
 def test_plan_passive_defaults_to_all_channels():
-    phases, kept = allan_plot.plan_capture(args())
-    assert phases is None
+    channel_sets, kept = allan_plot.plan_capture(args())
+    assert channel_sets is None
     assert kept == (0, 1, 2, 3)
 
 
 def test_plan_passive_channel_subset():
-    phases, kept = allan_plot.plan_capture(args(channels=(2,)))
-    assert phases is None
+    channel_sets, kept = allan_plot.plan_capture(args(channels=(2,)))
+    assert channel_sets is None
     assert kept == (2,)
 
 
-def test_plan_calboard_all_is_two_phases():
-    phases, kept = allan_plot.plan_capture(args(use_calboard=True))
-    assert phases == [(1, 3), (2, 4)]
+def test_plan_calboard_all_is_two_parts():
+    channel_sets, kept = allan_plot.plan_capture(args(use_calboard=True))
+    assert channel_sets == [(1, 3), (2, 4)]
     assert kept == (0, 1, 2, 3)
 
 
-def test_plan_calboard_subset_is_one_phase():
-    phases, kept = allan_plot.plan_capture(
+def test_plan_calboard_subset_is_one_part():
+    channel_sets, kept = allan_plot.plan_capture(
         args(use_calboard=True, calboard_channels=(0, 2))
     )
-    assert phases == [(1, 3)]
+    assert channel_sets == [(1, 3)]
     assert kept == (0, 2)
 
 
@@ -84,6 +85,28 @@ def test_recorder_overflow_flags_instead_of_growing(tmp_path):
     header, feed = make_packet(0, [(1, 0, 0, 0), (2, 0, 0, 0), (3, 0, 0, 0)])
     rec.callback(header, feed, 0)
     assert rec.overflowed
+
+
+def test_capture_for_aborts_on_gap():
+    rec = SimpleNamespace(overflowed=False, missing_count=3, n_samples=0)
+    with pytest.raises(allan_plot.AllanError, match="dropped"):
+        asyncio.run(allan_plot.capture_for(rec, 30.0, "x"))
+
+
+def test_capture_for_aborts_on_overflow():
+    rec = SimpleNamespace(overflowed=True, missing_count=0, n_samples=0)
+    with pytest.raises(allan_plot.AllanError, match="rate"):
+        asyncio.run(allan_plot.capture_for(rec, 30.0, "x"))
+
+
+def test_capture_for_completes_clean_run():
+    rec = SimpleNamespace(overflowed=False, missing_count=0, n_samples=0)
+    asyncio.run(allan_plot.capture_for(rec, 0.05, "x"))  # returns, no raise
+
+
+def test_hms():
+    assert allan_plot._hms(5.9) == "0:00:05"
+    assert allan_plot._hms(3661) == "1:01:01"
 
 
 def test_reduce_excludes_railed_channel(tmp_path):
