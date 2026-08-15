@@ -94,6 +94,7 @@ class StdoutTee:
 
     def __init__(self, stream, path):
         self.stream = stream
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._file = open(path, "w", encoding="utf-8")
 
     def write(self, s):
