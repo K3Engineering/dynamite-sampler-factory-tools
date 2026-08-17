@@ -172,33 +172,85 @@ class GateParams:
     max_temp_spread_c: float = 0.2  # cal board temp drift over the run
 
 
+@dataclass
+class GateFailure:
+    """One gate violation: a machine-readable kind, the human-readable detail
+    line, and the DUT channels it implicates (empty = run-level)."""
+
+    kind: str
+    message: str
+    channels: tuple = ()
+
+
+@dataclass
+class GateReport:
+    """gate_run result: the detail failures plus per-channel verdict lines
+    for the operator (summary sub-lines are indented)."""
+
+    failures: list
+    summary: list
+
+    @property
+    def messages(self):
+        return [f.message for f in self.failures]
+
+
 def gate_run(segments, config_values, expected_span_by_ch, params):
-    """Run all quality gates. Returns a list of failure strings (empty = pass)."""
+    """Run all quality gates. Returns a GateReport (empty failures = pass)."""
     failures = []
 
     for seg in segments:
         label = f"phase {seg.phase} seq {seg.seq_idx} ({seg.commanded_mv:+d} mV)"
+        seg_chs = tuple(cal_ch - 1 for cal_ch in seg.cal_channels)
         if seg.n_samples < params.min_window_samples:
-            failures.append(f"{label}: only {seg.n_samples} samples in window")
+            failures.append(
+                GateFailure(
+                    "window-samples",
+                    f"{label}: only {seg.n_samples} samples in window",
+                    seg_chs,
+                )
+            )
         if seg.missing > params.max_missing:
-            failures.append(f"{label}: {seg.missing} dropped samples in window")
+            failures.append(
+                GateFailure(
+                    "dropped-samples",
+                    f"{label}: {seg.missing} dropped samples in window",
+                    seg_chs,
+                )
+            )
         for cal_ch in seg.cal_channels:
             std = seg.stds[cal_ch - 1]
             if std is not None and std > params.max_std_counts:
-                failures.append(f"{label}: ch{cal_ch - 1} window std {std:.1f} counts")
+                failures.append(
+                    GateFailure(
+                        "window-std",
+                        f"{label}: dut ch{cal_ch - 1} (cal ch{cal_ch}) "
+                        f"window std {std:.1f} counts",
+                        (cal_ch - 1,),
+                    )
+                )
 
     temps = [seg.temp_c for seg in segments]
     spread = max(temps) - min(temps)
     if spread > params.max_temp_spread_c:
         failures.append(
-            f"cal board temp spread {spread:.2f} C > {params.max_temp_spread_c}"
+            GateFailure(
+                "temp-spread",
+                f"cal board temp spread {spread:.2f} C > {params.max_temp_spread_c}",
+            )
         )
 
     for dut_ch in range(4):
         by_config = config_values.get(dut_ch, {})
         missing_cfgs = [k for k in range(CAL_POINT_COUNT) if not by_config.get(k)]
         if missing_cfgs:
-            failures.append(f"ch{dut_ch}: no data for configs {missing_cfgs}")
+            failures.append(
+                GateFailure(
+                    "no-data",
+                    f"dut ch{dut_ch}: no data for configs {missing_cfgs}",
+                    (dut_ch,),
+                )
+            )
             continue
         means = [statistics.fmean(by_config[k]) for k in range(CAL_POINT_COUNT)]
 
@@ -208,8 +260,12 @@ def gate_run(segments, config_values, expected_span_by_ch, params):
             gap = means[k] - means[k + 1]
             if gap < params.min_gap_counts:
                 failures.append(
-                    f"ch{dut_ch}: {CONFIG_LABELS[k]}/{CONFIG_LABELS[k + 1]} "
-                    f"gap {gap:.0f} < {params.min_gap_counts:.0f}"
+                    GateFailure(
+                        "gap",
+                        f"dut ch{dut_ch}: {CONFIG_LABELS[k]}/{CONFIG_LABELS[k + 1]} "
+                        f"gap {gap:.0f} < {params.min_gap_counts:.0f}",
+                        (dut_ch,),
+                    )
                 )
 
         # Reversal repeatability: the two passes through each interior point.
@@ -219,18 +275,26 @@ def gate_run(segments, config_values, expected_span_by_ch, params):
                 delta = abs(vals[0] - vals[1])
                 if delta > params.pass_tol_counts:
                     failures.append(
-                        f"ch{dut_ch}: {CONFIG_LABELS[k]} pass delta {delta:.0f} "
-                        f"> {params.pass_tol_counts:.0f}"
+                        GateFailure(
+                            "pass-delta",
+                            f"dut ch{dut_ch}: {CONFIG_LABELS[k]} pass delta {delta:.0f} "
+                            f"> {params.pass_tol_counts:.0f}",
+                            (dut_ch,),
+                        )
                     )
 
         # Drift closure: spread of the three dead-short visits.
         zeros = by_config[CFG_ZERO]
         if len(zeros) >= 2:
-            spread = max(zeros) - min(zeros)
-            if spread > params.zero_tol_counts:
+            zero_spread = max(zeros) - min(zeros)
+            if zero_spread > params.zero_tol_counts:
                 failures.append(
-                    f"ch{dut_ch}: zero spread {spread:.0f} "
-                    f"> {params.zero_tol_counts:.0f}"
+                    GateFailure(
+                        "zero-spread",
+                        f"dut ch{dut_ch}: zero spread {zero_spread:.0f} "
+                        f"> {params.zero_tol_counts:.0f}",
+                        (dut_ch,),
+                    )
                 )
 
         # Span cross-check against the nominal chain (gross errors only).
@@ -239,11 +303,102 @@ def gate_run(segments, config_values, expected_span_by_ch, params):
             span = means[CFG_POS_FS] - means[CFG_NEG_FS]
             if abs(span / expected - 1.0) > params.span_tol:
                 failures.append(
-                    f"ch{dut_ch}: span {span:.0f} vs nominal-chain {expected:.0f} "
-                    f"(>{params.span_tol:.0%} off)"
+                    GateFailure(
+                        "span",
+                        f"dut ch{dut_ch}: span {span:.0f} vs nominal-chain "
+                        f"{expected:.0f} (>{params.span_tol:.0%} off)",
+                        (dut_ch,),
+                    )
                 )
 
-    return failures
+    summary = summarize_failures(
+        segments, config_values, expected_span_by_ch, params, failures
+    )
+    return GateReport(failures, summary)
+
+
+def summarize_failures(segments, config_values, expected_span_by_ch, params, failures):
+    """Per-channel verdict lines for the operator, then run-level failures.
+
+    Each channel gets an OK or a named signature (gross/marginal) with the key numbers on indented
+    sub-lines. A total response across the sweep below the gap floor means the stimulus never
+    reached the ADC.
+    """
+    lines = []
+    for dut_ch in range(4):
+        lines.extend(
+            _channel_verdict(
+                dut_ch, segments, config_values, expected_span_by_ch, params, failures
+            )
+        )
+    lines.extend(f"run: {f.message}" for f in failures if not f.channels)
+    return lines
+
+
+def _channel_verdict(
+    dut_ch, segments, config_values, expected_span_by_ch, params, failures
+):
+    """One channel's headline verdict plus indented explanation sub-lines."""
+    ch_failures = [f for f in failures if dut_ch in f.channels]
+    if not ch_failures:
+        return [f"ch{dut_ch}: OK"]
+    kinds = {f.kind for f in ch_failures}
+    cal_ch = dut_ch + 1
+    driven = [seg for seg in segments if cal_ch in seg.cal_channels]
+    where = f"cal ch{cal_ch}" + (f", phase {driven[0].phase}" if driven else "")
+
+    by_config = config_values.get(dut_ch, {})
+    if not all(by_config.get(k) for k in range(CAL_POINT_COUNT)):
+        missing = [k for k in range(CAL_POINT_COUNT) if not by_config.get(k)]
+        return [
+            f"ch{dut_ch}: NO DATA (gross)",
+            f"     no samples for configs {missing} ({where}) — capture/feed problem",
+        ]
+
+    means = [statistics.fmean(by_config[k]) for k in range(CAL_POINT_COUNT)]
+    response = max(means) - min(means)
+    span = means[CFG_POS_FS] - means[CFG_NEG_FS]
+    expected = expected_span_by_ch[dut_ch]
+
+    # Flat channel: the whole +/-FS sweep moved the output less than one
+    # minimally-acceptable step — the stimulus never reached the ADC.
+    if response < params.min_gap_counts:
+        return [
+            f"ch{dut_ch}: NO RESPONSE TO STIMULUS (gross)",
+            f"     span {span:.0f} counts vs expected ~{expected / 1e6:.1f}M; "
+            f"all 5 config means within {response:.0f} counts",
+            f"     driven by {where} — check fixture wiring / AFE channel",
+        ]
+
+    if "span" in kinds:
+        sub = []
+        if expected:
+            sub.append(
+                f"     span {span:.0f} vs expected ~{expected / 1e6:.1f}M counts "
+                f"({abs(span / expected - 1.0):.0%} off), {where}"
+            )
+        extra = kinds - {"span"}
+        if extra:
+            sub.append(f"     also: {', '.join(sorted(extra))} — see detail")
+        return [f"ch{dut_ch}: SPAN OFF (gross)", *sub]
+
+    if "window-std" in kinds:
+        stds = [seg.stds[dut_ch] for seg in driven if seg.stds[dut_ch] is not None]
+        over = sum(s > params.max_std_counts for s in stds)
+        # "marginal": within 2x of the (gross-fault) ceiling — likely a real
+        # noise floor sitting at the threshold, not a broken channel.
+        tag = "marginal" if max(stds) <= 2 * params.max_std_counts else "gross"
+        sub = [
+            f"     window std {min(stds):.0f}-{max(stds):.0f} counts vs "
+            f"{params.max_std_counts:.0f} ceiling; over in {over} of "
+            f"{len(stds)} windows ({where})"
+        ]
+        extra = kinds - {"window-std"}
+        if extra:
+            sub.append(f"     also: {', '.join(sorted(extra))} — see detail")
+        return [f"ch{dut_ch}: NOISY ({tag})", *sub]
+
+    return [f"ch{dut_ch}: FAILED ({', '.join(sorted(kinds))}) — see detail"]
 
 
 def _fmt(value):

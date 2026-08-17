@@ -18,8 +18,14 @@ def make_segments(
     missing=0,
     scramble=False,
     temp=23.0,
+    flat=(),
+    ch_std=None,
 ):
-    """A full synthetic run: 2 phases x 9 sweep states, noise-free means."""
+    """A full synthetic run: 2 phases x 9 sweep states, noise-free means.
+
+    flat: DUT channels that ignore the stimulus (dead channel). ch_std:
+    per-DUT-channel window std overrides.
+    """
     setpoints = cal_math.ladder_setpoints_mv_per_v()
     segments = []
     for phase, channels in enumerate(PHASES):
@@ -29,7 +35,10 @@ def make_segments(
                 cfg = cal_math.CFG_POS_MID  # +FS reads like +mid
             means = [None] * 4
             for cal_ch in channels:
-                means[cal_ch - 1] = offset + cmvv * setpoints[cfg]
+                dut_ch = cal_ch - 1
+                means[dut_ch] = (
+                    offset if dut_ch in flat else offset + cmvv * setpoints[cfg]
+                )
             segments.append(
                 cal_math.SegmentResult(
                     phase=phase,
@@ -42,7 +51,7 @@ def make_segments(
                     n_samples=n,
                     missing=missing,
                     means=tuple(means),
-                    stds=(std,) * 4,
+                    stds=tuple((ch_std or {}).get(ch, std) for ch in range(4)),
                     temp_c=temp,
                 )
             )
@@ -121,12 +130,13 @@ def test_segment_stats_empty():
 
 
 def test_gate_clean_run_passes():
-    assert gate(make_segments()) == []
+    report = gate(make_segments())
+    assert report.failures == []
 
 
 def test_gate_detects_scrambled_order():
-    failures = gate(make_segments(scramble=True))
-    assert any("gap" in f for f in failures)
+    messages = gate(make_segments(scramble=True)).messages
+    assert any("gap" in m for m in messages)
 
 
 def test_gate_detects_pass_delta():
@@ -134,8 +144,8 @@ def test_gate_detects_pass_delta():
     for seg in segments:
         if seg.commanded_mv == 5 and seg.seq_idx == 3:  # second +5 pass
             seg.means = tuple(None if m is None else m + 1000.0 for m in seg.means)
-    failures = gate(segments)
-    assert any("pass delta" in f for f in failures)
+    messages = gate(segments).messages
+    assert any("pass delta" in m for m in messages)
 
 
 def test_gate_detects_zero_drift():
@@ -143,35 +153,86 @@ def test_gate_detects_zero_drift():
     for seg in segments:
         if seg.commanded_mv == 0 and seg.seq_idx == 8:  # last zero
             seg.means = tuple(None if m is None else m + 500.0 for m in seg.means)
-    failures = gate(segments)
-    assert any("zero spread" in f for f in failures)
+    messages = gate(segments).messages
+    assert any("zero spread" in m for m in messages)
 
 
 def test_gate_detects_wrong_span():
-    failures = gate(make_segments(cmvv=1.5e6))  # 25% off the nominal chain
-    assert any("span" in f for f in failures)
+    messages = gate(make_segments(cmvv=1.5e6)).messages  # 25% off the nominal chain
+    assert any("span" in m for m in messages)
 
 
 def test_gate_detects_noisy_window():
-    failures = gate(make_segments(std=500.0))
-    assert any("window std" in f for f in failures)
+    messages = gate(make_segments(std=500.0)).messages
+    assert any("window std" in m for m in messages)
 
 
 def test_gate_detects_empty_window():
-    failures = gate(make_segments(n=0))
-    assert any("samples in window" in f for f in failures)
+    messages = gate(make_segments(n=0)).messages
+    assert any("samples in window" in m for m in messages)
 
 
 def test_gate_detects_dropped_samples():
-    failures = gate(make_segments(missing=3))
-    assert any("dropped samples" in f for f in failures)
+    messages = gate(make_segments(missing=3)).messages
+    assert any("dropped samples" in m for m in messages)
 
 
 def test_gate_detects_temp_spread():
     segments = make_segments()
     segments[0].temp_c = 25.0  # 2 C above the rest of the run
-    failures = gate(segments)
-    assert any("temp spread" in f for f in failures)
+    messages = gate(segments).messages
+    assert any("temp spread" in m for m in messages)
+
+
+def test_detail_names_dut_and_cal_channels():
+    messages = gate(make_segments(std=500.0)).messages
+    assert any("dut ch0 (cal ch1)" in m for m in messages)
+    assert any("dut ch3 (cal ch4)" in m for m in messages)
+
+
+# -- failure summary -----------------------------------------------------------
+
+
+def test_summary_clean_run_all_ok():
+    report = gate(make_segments())
+    assert report.summary == [f"ch{i}: OK" for i in range(4)]
+
+
+def test_summary_names_flat_channel():
+    report = gate(make_segments(flat=(2,)))
+    assert "ch2: NO RESPONSE TO STIMULUS (gross)" in report.summary
+    # The wiring pointer names the cal-board channel driving DUT ch2.
+    assert any("cal ch3, phase 0" in line for line in report.summary)
+    # The measured-vs-expected magnitude is on a sub-line.
+    assert any("span 0 counts vs expected ~8.0M" in line for line in report.summary)
+    # Other channels are unaffected.
+    assert "ch0: OK" in report.summary
+
+
+def test_summary_noisy_channel_marginal():
+    report = gate(make_segments(ch_std={3: 150.0}))  # 1.5x the ceiling
+    assert "ch3: NOISY (marginal)" in report.summary
+    # ch3 is driven in phase 1 only: 9 windows.
+    assert any("over in 9 of 9 windows" in line for line in report.summary)
+
+
+def test_summary_noisy_channel_gross():
+    report = gate(make_segments(ch_std={1: 500.0}))
+    assert "ch1: NOISY (gross)" in report.summary
+
+
+def test_summary_span_off_headline():
+    report = gate(make_segments(cmvv=1.5e6))  # 25% off the nominal chain
+    assert "ch0: SPAN OFF (gross)" in report.summary
+    assert any("(25% off)" in line for line in report.summary)
+
+
+def test_summary_temp_spread_is_run_level():
+    segments = make_segments()
+    segments[0].temp_c = 25.0  # 2 C above the rest of the run
+    report = gate(segments)
+    assert any(line.startswith("run: cal board temp spread") for line in report.summary)
+    assert all(f"ch{i}: OK" in report.summary for i in range(4))
 
 
 # -- flash entries -----------------------------------------------------------

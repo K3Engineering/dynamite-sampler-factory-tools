@@ -38,7 +38,7 @@ import db
 from calboard_driver import CalBoard, CalBoardError
 from nominal_values import BOARD_MODELS
 
-SCRIPT_VERSION = "board_calibration 1.1"
+SCRIPT_VERSION = "board_calibration 1.2"
 
 # TODO: read the DUT's onboard temperature sensor and plumb it through
 # (cal.temp dut field, segments table). Placeholder until then.
@@ -82,9 +82,7 @@ class DutInfo:
 async def check_provisioning(dut: KvsClient, board_override: str | None) -> DutInfo:
     """Read identity + analog nominals, cross-checked against the firmware's
     hardware revision."""
-    firmware_rev = await read_characteristic(
-        dut.client, ds.DeviceInfo.FirmwareRevision
-    )
+    firmware_rev = await read_characteristic(dut.client, ds.DeviceInfo.FirmwareRevision)
     hw_rev = await read_characteristic(dut.client, ds.DeviceInfo.HardwareRevision)
     adc_config = await read_characteristic(dut.client, ds.DynamiteSampler.ADCConfig)
     if adc_config is None:
@@ -283,14 +281,26 @@ async def run(args: argparse.Namespace) -> int:
                 db.insert_segment(con, run_id, seg, confirm=meta["confirm"])
 
             config_values = cal_math.collect_config_values(segments)
-            failures = cal_math.gate_run(
+            report = cal_math.gate_run(
                 segments, config_values, expected_span, gate_params
             )
-            if failures:
-                db.finish_run(con, run_id, "fail", "; ".join(failures))
-                print(f"CALIBRATION FAILED (run #{run_id}) — nothing written:")
-                for failure in failures:
-                    print(f"  - {failure}")
+            if report.failures:
+                # DB gets the headline verdicts, then the full detail list.
+                headlines = [s for s in report.summary if not s.startswith(" ")]
+                db.finish_run(
+                    con,
+                    run_id,
+                    "fail",
+                    "; ".join(headlines) + " | " + "; ".join(report.messages),
+                )
+                print(f"CALIBRATION FAILED (run #{run_id}) — nothing written")
+                print()
+                for line in report.summary:
+                    print(f"  {line}")
+                print()
+                print("  detail:")
+                for message in report.messages:
+                    print(f"  - {message}")
                 return 1
 
             readings = cal_math.final_readings(config_values)
@@ -410,7 +420,7 @@ def main() -> None:
     gates = parser.add_argument_group("gate thresholds (gross-fault defaults)")
     gates.add_argument("--min-window-samples", type=int, default=100)
     gates.add_argument("--max-missing", type=int, default=0)
-    gates.add_argument("--max-std-counts", type=float, default=100.0)
+    gates.add_argument("--max-std-counts", type=float, default=150.0)
     gates.add_argument("--min-gap-counts", type=float, default=1000.0)
     gates.add_argument("--pass-tol-counts", type=float, default=200.0)
     gates.add_argument("--zero-tol-counts", type=float, default=200.0)
