@@ -56,7 +56,13 @@ import numpy as np
 
 from kvs_api_shim import KvsClient, KvsError
 
-from dynamite_sampler_bleak_util import FeedSession, NotifyCallbackFeeddatas
+import dynamite_sampler_api as ds
+from dynamite_sampler_bleak_util import (
+    FeedSession,
+    NotifyCallbackFeeddatas,
+    read_characteristic,
+    write_characteristic,
+)
 from capture import FeedRecorder
 
 import allan_math
@@ -64,7 +70,7 @@ from board_calibration import PHASES, check_provisioning
 from calboard_driver import CalBoard, CalBoardError
 from nominal_values import BOARD_MODELS
 
-SCRIPT_VERSION = "allan_plot 1.2.2"
+SCRIPT_VERSION = "allan_plot 1.3.0"
 
 DEFAULT_CAPTURE_DIR = Path(__file__).resolve().with_name("captures")
 
@@ -80,9 +86,7 @@ CAPACITY_SLACK_S = 10.0
 def estimate_capacity(rate, duration, n_parts, guard):
     """Buffer size for a capture: every streamed sample is buffered, including
     guard and startup rows outside the analysis windows."""
-    return (
-        int(rate * (duration * n_parts + guard * n_parts + CAPACITY_SLACK_S)) + 64
-    )
+    return int(rate * (duration * n_parts + guard * n_parts + CAPACITY_SLACK_S)) + 64
 
 
 class AllanError(Exception):
@@ -420,6 +424,17 @@ async def run(args: argparse.Namespace) -> int:
 
     async with await KvsClient.connect(args.address) as dut:
         info = await check_provisioning(dut, args.board)
+        if args.tx_power is not None:
+            print(f"Setting TX power to {args.tx_power} dBm")
+            await write_characteristic(dut.client, ds.TxPower.TxPowerSet, args.tx_power)
+        # Always recorded — it's a measurement condition. Read back after the
+        # write too: the firmware only logs a failed setPower, nothing comes
+        # back over BLE.
+        tx_power_dbm = await read_characteristic(dut.client, ds.DeviceInfo.TxPowerLevel)
+        if args.tx_power is not None and tx_power_dbm != args.tx_power:
+            raise AllanError(
+                f"TX power readback {tx_power_dbm} dBm != requested {args.tx_power} dBm"
+            )
         rate = info.adc_config.sample_rate
         volts_per_count_ch = [
             allan_math.volts_per_count(
@@ -460,6 +475,7 @@ async def run(args: argparse.Namespace) -> int:
                 device_info={
                     "FirmwareRevision": info.firmware_rev,
                     "ADCConfig": info.adc_config,
+                    "TxPowerLevel": tx_power_dbm,
                 },
             )
             try:
@@ -554,8 +570,8 @@ async def run(args: argparse.Namespace) -> int:
                     f"{info.board_model} @ {rate} SPS"
                 ),
                 (
-                    f"{started:%Y-%m-%d %H:%M}Z · {mode_line} · {SCRIPT_VERSION} · "
-                    f"{info.firmware_rev}"
+                    f"{started:%Y-%m-%d %H:%M}Z · {mode_line} · TX {tx_power_dbm} dBm · "
+                    f"{SCRIPT_VERSION} · {info.firmware_rev}"
                 ),
             ]
             adev_path, spec_path, psd_path = make_plots(
@@ -592,6 +608,14 @@ def main() -> None:
         "--board",
         choices=sorted(BOARD_MODELS),
         help="board model (default: read from the provisioned Factory namespace)",
+    )
+    parser.add_argument(
+        "--tx-power",
+        type=int,
+        choices=[-12, -9, -6, -3, 0, 3, 6, 9],
+        metavar="DBM",
+        help="set the DUT's BLE TX power for the capture; persists on the "
+        "device until reboot (default: leave as-is)",
     )
     parser.add_argument(
         "--duration",
