@@ -237,7 +237,7 @@ async def run(args: argparse.Namespace) -> int:
             {
                 "ts_utc": started.isoformat(timespec="seconds"),
                 "device_address": dut.client.address,
-                "device_name": dut.device_name,
+                "device_name": dut.advertised_name,
                 "board_model": dut_info.board_model,
                 "firmware_rev": dut_info.firmware_rev,
                 "cal_board_id": cal.fw_id,
@@ -338,7 +338,7 @@ async def run(args: argparse.Namespace) -> int:
                 {
                     "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "device_address": dut.client.address,
-                    "device_name": dut.device_name,
+                    "device_name": dut.advertised_name,
                     "board_model": dut_info.board_model,
                     "firmware_rev": dut_info.firmware_rev,
                     "keys_written": entries,

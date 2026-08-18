@@ -64,7 +64,7 @@ async def inspect(args: argparse.Namespace) -> int:
     async with await KvsClient.connect(args.address) as device:
         device_info = {
             "address": device.client.address,
-            "name": device.device_name,
+            "name": device.advertised_name,
             "board_model": await read_characteristic(
                 device.client, ds.DeviceInfo.HardwareRevision
             ),

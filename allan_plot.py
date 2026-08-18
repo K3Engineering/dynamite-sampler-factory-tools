@@ -566,7 +566,7 @@ async def run(args: argparse.Namespace) -> int:
                 )
             meta_lines = [
                 (
-                    f"Allan deviation — {dut.device_name} {dut.client.address} — "
+                    f"Allan deviation — {dut.advertised_name} {dut.client.address} — "
                     f"{info.board_model} @ {rate} SPS"
                 ),
                 (
