@@ -244,7 +244,6 @@ def test_build_flash_entries_roundtrip():
     entries = cal_math.build_flash_entries(
         readings,
         "calboard-fw 1.0.0",
-        exc_mv=4527.0,
         now=__import__("datetime").datetime(
             2026, 8, 7, tzinfo=__import__("datetime").timezone.utc
         ),
@@ -257,7 +256,6 @@ def test_build_flash_entries_roundtrip():
         "cal.board",
         "cal.r.prov",
         "cal.temp",
-        "cal.exc.mv",
     }
     raw = [float(v) for v in entries["ch0.raw"].split(",")]
     assert len(raw) == cal_math.CAL_POINT_COUNT
@@ -265,18 +263,8 @@ def test_build_flash_entries_roundtrip():
     assert raw[0] > raw[1] > raw[2] > raw[3] > raw[4]
     assert entries["ch0.r"] == "10000,10,10,10,10,10000"
     assert entries["cal.r.prov"] == "nominal"
-    assert entries["cal.exc.mv"] == "4527"
     assert entries["cal.temp"] == "-999,23.4375"  # placeholder DUT temp
     assert entries["cal.date"].startswith("2026-08-07T")
-
-
-def test_build_flash_entries_without_exc():
-    segments = make_segments()
-    readings = cal_math.final_readings(cal_math.collect_config_values(segments))
-    entries = cal_math.build_flash_entries(
-        readings, "x", temp_dut_c=-999.0, temp_calboard_c=23.0
-    )
-    assert "cal.exc.mv" not in entries
 
 
 def test_build_flash_entries_provenance_keys():

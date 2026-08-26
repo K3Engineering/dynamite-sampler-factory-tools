@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS runs (
     cal_board_id TEXT,
     cal_board_uid TEXT,     -- TMP118 48-bit unique ID (hex): physical board identity
     cal_port TEXT,
-    exc_mv REAL,            -- optional manual DMM entry (cal.exc.mv)
     csv_path TEXT,
     dwell_s REAL,
     guard_s REAL,
@@ -81,9 +80,9 @@ def insert_run(con: sqlite3.Connection, record: dict) -> int:
     cur = con.execute(
         "INSERT INTO runs"
         " (ts_utc, device_address, device_name, board_model, firmware_rev,"
-        "  cal_board_id, cal_board_uid, cal_port, exc_mv,"
+        "  cal_board_id, cal_board_uid, cal_port,"
         "  csv_path, dwell_s, guard_s, script)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             record["ts_utc"],
             record["device_address"],
@@ -93,7 +92,6 @@ def insert_run(con: sqlite3.Connection, record: dict) -> int:
             record.get("cal_board_id"),
             record.get("cal_board_uid"),
             record.get("cal_port"),
-            record.get("exc_mv"),
             record.get("csv_path"),
             record.get("dwell_s"),
             record.get("guard_s"),

@@ -243,7 +243,6 @@ async def run(args: argparse.Namespace) -> int:
                 "cal_board_id": cal.fw_id,
                 "cal_board_uid": cal_uid,
                 "cal_port": cal.port,
-                "exc_mv": args.exc_mv,
                 "csv_path": str(csv_path),
                 "dwell_s": args.dwell,
                 "guard_s": args.guard,
@@ -308,7 +307,6 @@ async def run(args: argparse.Namespace) -> int:
             entries = cal_math.build_flash_entries(
                 readings,
                 cal.fw_id,
-                exc_mv=args.exc_mv,
                 now=started,
                 tool=SCRIPT_VERSION,
                 origin="factory",
@@ -406,11 +404,6 @@ def main() -> None:
         type=float,
         default=0.4,
         help="settling guard after each relay command, seconds (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--exc-mv",
-        type=float,
-        help="DMM-measured excitation in mV (stored as cal.exc.mv; omit to skip)",
     )
     parser.add_argument(
         "--dry-run",

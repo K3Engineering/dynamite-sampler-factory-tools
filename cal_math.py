@@ -409,7 +409,6 @@ def _fmt(value):
 def build_flash_entries(
     readings,
     cal_board_id,
-    exc_mv=None,
     now=None,
     resistors=NOMINAL_LADDER_RESISTORS,
     r_provenance=PROVENANCE_NOMINAL,
@@ -439,8 +438,6 @@ def build_flash_entries(
     entries["cal.board"] = cal_board_id
     entries["cal.r.prov"] = r_provenance
     entries["cal.temp"] = f"{_fmt(temp_dut_c)},{_fmt(temp_calboard_c)}"
-    if exc_mv is not None:
-        entries["cal.exc.mv"] = _fmt(exc_mv)
     if tool is not None:
         entries["cal.tool"] = tool
     if origin is not None:
