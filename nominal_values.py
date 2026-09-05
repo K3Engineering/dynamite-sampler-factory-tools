@@ -15,7 +15,7 @@ BOARD_MODELS: dict[str, dict[str, str]] = {
     "v400": {"adc_fsr": "1.2", "exc": "4.53", "afe_gain": "50.0"},
     "v500": {"adc_fsr": "1.2", "exc": "4.53", "afe_gain": "50.0"},
     "v600L": {"adc_fsr": "1.2", "exc": "2.8", "afe_gain": "1.0"},
-    "v600P": {"adc_fsr": "1.2", "exc": "4.53", "afe_gain": "101.0"},
+    # v6p is deprecated as it's 8ch
     "v700L": {"adc_fsr": "1.2", "exc": "2.8", "afe_gain": "1.0"},
     "v700P": {"adc_fsr": "1.2", "exc": "4.53", "afe_gain": "101.0"},
 }

@@ -1,13 +1,14 @@
 """Flash nominal values (EXC, etc)
 
-Run after firmware flashing, before calibration. The board model is
-auto-detected from the firmware's Hardware Revision BLE characteristic
-(--board overrides), its nominal analog values are looked up and written
-to the Factory namespace over BLE. To wipe the namespace instead, use
-edit_flash.py.
+Run after firmware flashing, before calibration. With unified firmware,
+--board is mandatory, and `board_model` is written to the Factory namespace.
+
+If the device already carries a different identity, the script refuses to
+proceed; erase flash to re-provision. To wipe the Factory namespace instead,
+use edit_flash.py.
 
 Usage:
-    python flash_factory_nominals.py [--address AA:BB:CC:DD:EE:FF] [--board v700P] [--dry-run]
+    python flash_factory_nominals.py --board v700P [--address AA:BB:CC:DD:EE:FF] [--dry-run]
 """
 
 import argparse
@@ -19,53 +20,48 @@ from nominal_values import BOARD_MODELS, nominal_entries
 import dynamite_sampler_api as ds
 from dynamite_sampler_bleak_util import read_characteristic
 
+# What the unified firmware reports in DIS Hardware Revision when it has no
+# usable identity (safe mode).
+SAFE_MODE_IDENTITY = "UNCONFIGURED"
 
-async def detect_board_model(device: KvsClient) -> str:
-    """Board model compiled into the flashed firmware, e.g. 'v700P'."""
-    model = await read_characteristic(device.client, ds.DeviceInfo.HardwareRevision)
-    if not model:
+
+async def read_reported_identity(device: KvsClient) -> str:
+    """DIS Hardware Revision: the flashed identity, or 'UNCONFIGURED' in safe mode."""
+    rev = await read_characteristic(device.client, ds.DeviceInfo.HardwareRevision)
+    if not rev:
         raise KvsError("Could not read the Hardware Revision characteristic")
-    return model
+    return rev
 
 
 async def provision(args: argparse.Namespace) -> int:
     # Fully offline dry-run: no device needed.
-    if args.dry_run and args.board:
-        print(
-            f"Would write to the Factory namespace ({args.address or 'auto-detected device'}):"
-        )
+    if args.dry_run and not args.address:
+        print("Would write to the Factory namespace (auto-detected device):")
         for key, value in nominal_entries(args.board).items():
             print(f"  {key:12s} = {value}")
         return 0
 
     async with await KvsClient.connect(args.address) as device:
-        detected = await detect_board_model(device)
-        board = args.board or detected
-        if args.board and args.board != detected:
+        reported = await read_reported_identity(device)
+        if reported not in (SAFE_MODE_IDENTITY, args.board):
             raise KvsError(
-                f"--board {args.board} does not match the firmware's "
-                f"Hardware Revision ({detected!r})"
+                f"Device already has a different identity ({reported!r}); "
+                "erase flash to re-provision."
             )
-        if board not in BOARD_MODELS:
-            raise KvsError(
-                f"Unknown board model {board!r} "
-                f"(known: {', '.join(sorted(BOARD_MODELS))}). "
-                "Update BOARD_MODELS in nominal_values.py."
-            )
-
+        needs_reboot = reported == SAFE_MODE_IDENTITY
         print(
-            f"Board model: {board}"
-            f"{' (from --board, matches firmware)' if args.board else ' (auto-detected)'}"
+            f"Board model: {args.board} "
+            f"({'unconfigured device, writing identity' if needs_reboot else 'matches device identity'})"
         )
 
         if args.dry_run:
             print("Would write to the Factory namespace:")
-            for key, value in nominal_entries(board).items():
+            for key, value in nominal_entries(args.board).items():
                 print(f"  {key:12s} = {value}")
             return 0
 
         failures = 0
-        for key, value in nominal_entries(board).items():
+        for key, value in nominal_entries(args.board).items():
             readback = await device.set_verified(FOLDER_FACTORY, key, value)
             ok = readback == value
             failures += not ok
@@ -76,7 +72,9 @@ async def provision(args: argparse.Namespace) -> int:
     if failures:
         print(f"FAILED: {failures} keys did not read back")
         return 1
-    print(f"Factory nominals for {board} provisioned and verified.")
+    print(f"Factory nominals for {args.board} provisioned and verified.")
+    if needs_reboot:
+        print("Reboot the device for the new identity to take effect.")
     return 0
 
 
@@ -84,9 +82,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--board",
+        required=True,
         choices=sorted(BOARD_MODELS),
-        help="board model (default: auto-detect from the firmware's "
-        "Hardware Revision characteristic)",
+        help="board model to write as the device identity",
     )
     parser.add_argument(
         "--address",
