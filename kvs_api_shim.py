@@ -23,7 +23,9 @@ from dynamite_sampler_kvs import (  # noqa: E402
     FOLDER_USER,
     KVS_WRITE_DELAY_S,
     NVS_TYPE_STR,
+    KvsBusy,
     KvsClient,
+    KvsDeviceError,
     KvsError,
 )
 
@@ -34,7 +36,9 @@ __all__ = [
     "FOLDER_USER",
     "KVS_WRITE_DELAY_S",
     "NVS_TYPE_STR",
+    "KvsBusy",
     "KvsClient",
+    "KvsDeviceError",
     "KvsError",
     "folder_type",
 ]
