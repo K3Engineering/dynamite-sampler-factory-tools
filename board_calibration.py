@@ -29,7 +29,7 @@ from pathlib import Path
 
 from kvs_api_shim import FOLDER_FACTORY, KVS_WRITE_DELAY_S, KvsClient, KvsError
 
-import dynamite_sampler_api as ds
+from dynamite_sampler import gatt as ds
 from dynamite_sampler_bleak_util import FeedSession, read_characteristic
 from capture import FeedRecorder
 
@@ -84,7 +84,7 @@ async def check_provisioning(dut: KvsClient, board_override: str | None) -> DutI
     hardware revision."""
     firmware_rev = await read_characteristic(dut.client, ds.DeviceInfo.FirmwareRevision)
     hw_rev = await read_characteristic(dut.client, ds.DeviceInfo.HardwareRevision)
-    adc_config = await read_characteristic(dut.client, ds.DynamiteSampler.ADCConfig)
+    adc_config = await read_characteristic(dut.client, ds.DynamiteSamplerService.ADCConfig)
     if adc_config is None:
         raise KvsError("ADC config unreadable — cannot cross-check the span")
 

@@ -56,7 +56,7 @@ import numpy as np
 
 from kvs_api_shim import KvsClient, KvsError
 
-import dynamite_sampler_api as ds
+from dynamite_sampler import gatt as ds
 from dynamite_sampler_bleak_util import (
     FeedSession,
     NotifyCallbackFeeddatas,

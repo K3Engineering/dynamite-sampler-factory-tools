@@ -24,13 +24,12 @@ import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-ADC_COUNTS_PER_POLARITY = 1 << 23  # 24-bit bipolar
-
-# [top 10k, four 10R, bottom 10k], in signal order from EXC+ to GND.
-NOMINAL_LADDER_RESISTORS = (10000.0, 10.0, 10.0, 10.0, 10.0, 10000.0)
-
-CAL_POINT_COUNT = 5
-LADDER_RESISTOR_COUNT = 6
+from dynamite_sampler.cal_math import (
+    CAL_POINT_COUNT,
+    NOMINAL_LADDER_RESISTORS,
+    expected_counts_per_mvv,
+    ladder_setpoints_mv_per_v,
+)
 
 CONFIG_LABELS = ("(t1,t5)", "(t2,t4)", "(t3,t3)", "(t4,t2)", "(t5,t1)")
 
@@ -58,34 +57,6 @@ SWEEP_SEQUENCE_MV = (0, 5, 10, 5, 0, -5, -10, -5, 0)
 # Provenance tag for the ladder resistors while no per-board characterization
 # exists (see docs/flash-schema-v1.md).
 PROVENANCE_NOMINAL = "nominal"
-
-
-def ladder_setpoints_mv_per_v(resistors=NOMINAL_LADDER_RESISTORS):
-    """Differential setpoints (mV/V of excitation) per config, storage order.
-
-    Pure function of the ladder resistors — the ladder is ratiometric, so the
-    excitation cancels and only ratios matter.
-    """
-    if len(resistors) != LADDER_RESISTOR_COUNT:
-        raise ValueError(f"need {LADDER_RESISTOR_COUNT} ladder resistors")
-    if any(r <= 0 for r in resistors):
-        raise ValueError("ladder resistors must be positive")
-    # Resistance below each tap (toward GND); tap t_k sits above resistors[k].
-    below = [0.0] * CAL_POINT_COUNT
-    acc = 0.0
-    for i in range(LADDER_RESISTOR_COUNT - 1, 0, -1):
-        acc += resistors[i]
-        below[i - 1] = acc
-    total = acc + resistors[0]
-    return [
-        1000.0 * (below[k] - below[CAL_POINT_COUNT - 1 - k]) / total
-        for k in range(CAL_POINT_COUNT)
-    ]
-
-
-def expected_counts_per_mvv(adc_fsr_v, afe_gain, pga_gain, exc_v):
-    """Nominal analog chain: ADC counts per mV/V of load-cell output."""
-    return ADC_COUNTS_PER_POLARITY * afe_gain * pga_gain / (adc_fsr_v * 1000.0) * exc_v
 
 
 def expected_span_counts(

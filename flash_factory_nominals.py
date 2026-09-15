@@ -17,7 +17,7 @@ import sys
 
 from kvs_api_shim import FOLDER_FACTORY, KvsClient, KvsError
 from nominal_values import BOARD_MODELS, nominal_entries
-import dynamite_sampler_api as ds
+from dynamite_sampler import gatt as ds
 from dynamite_sampler_bleak_util import read_characteristic
 
 # What the unified firmware reports in DIS Hardware Revision when it has no

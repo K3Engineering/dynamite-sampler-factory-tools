@@ -1,9 +1,9 @@
 """KVS imports for the factory tools — TEMPORARY shim.
 
-The device-neutral client lives in the sibling python-api project
-(dynamite_sampler_kvs.py); this module puts it on sys.path and re-exports it.
-Once python-api becomes an installable package, delete this shim and import
-from dynamite_sampler_kvs directly.
+The device-neutral client lives in the sibling python-api package
+(``dynamite_sampler.kvs``); this module puts its ``src`` (and the flat legacy
+modules) on sys.path and re-exports what the factory CLIs use. Delete once
+python-api is installed in the factory venv.
 
 folder_type is the exception: it is argparse plumbing for the factory CLIs
 and stays here on purpose.
@@ -13,10 +13,11 @@ import argparse
 import sys
 from pathlib import Path
 
-# The python-api folder is a sibling of this project and uses flat imports.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python-api"))
+_PYTHON_API = Path(__file__).resolve().parent.parent / "python-api"
+sys.path.insert(0, str(_PYTHON_API / "src"))
+sys.path.insert(0, str(_PYTHON_API))
 
-from dynamite_sampler_kvs import (  # noqa: E402
+from dynamite_sampler.kvs import (  # noqa: E402
     FOLDER_FACTORY,
     FOLDER_NAMES,
     FOLDER_SETTINGS,

@@ -21,7 +21,7 @@ from kvs_api_shim import (
     KvsError,
     folder_type,
 )
-import dynamite_sampler_api as ds
+from dynamite_sampler import gatt as ds
 from dynamite_sampler_bleak_util import read_characteristic
 
 
