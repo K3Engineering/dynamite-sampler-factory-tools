@@ -5,14 +5,14 @@ Flow:
      nominals) and the ADC config (sample rate, per-channel PGA).
      Optionally, connect to the calibration board and set up shorts
   2. Record a contiguous capture to CSV. A single dropped sample aborts the
-     run — Allan math requires a gap-free record.
+      run — Allan math requires a gap-free record.
      3. Per channel: overlapping Allan deviation on an 8-points/octave tau grid,
-     converted to nV referred to the AFE input, plus a Hann amplitude
-     spectrum and a Welch amplitude spectral density. Narrowband peaks
-     (Hann FFT, peaks > 6x the median bin) are listed in the report and
-     marked on the spectrum. Three PNGs (ADEV, per-channel spectrum, per-channel PSD)
-     are saved next to the CSV, a .txt copy of the console output (minus
-     the live progress line) alongside; windows are shown unless --no-show.
+      converted to nV referred to the AFE input, plus a Hann amplitude
+      spectrum and a Welch amplitude spectral density. Narrowband peaks
+      (Hann FFT, peaks > 6x the median bin) are listed in the report and
+      marked on the spectrum. Three PNGs (ADEV, per-channel spectrum, per-channel PSD)
+      are saved next to the CSV, a .txt copy of the console output (minus
+      the live progress line) alongside; windows are shown unless --no-show.
 
 Modes:
   passive (default): measure whatever is attached (load cells, bench
@@ -45,7 +45,6 @@ annotate the plot with it — the drift leg of the Allan plot is temperature.
 
 import argparse
 import asyncio
-import csv
 import sys
 import time
 from dataclasses import dataclass
@@ -54,23 +53,15 @@ from pathlib import Path
 
 import numpy as np
 
-from kvs_api_shim import KvsClient, KvsError
-
-from dynamite_sampler import gatt as ds
-from dynamite_sampler_bleak_util import (
-    FeedSession,
-    NotifyCallbackFeeddatas,
-    read_characteristic,
-    write_characteristic,
-)
-from capture import FeedRecorder
+from kvs_api_shim import AsyncDynamiteSampler, KvsError
+from capture import CsvCapture, FeedPump
 
 import allan_math
 from board_calibration import PHASES, check_provisioning
 from calboard_driver import CalBoard, CalBoardError
 from nominal_values import BOARD_MODELS
 
-SCRIPT_VERSION = "allan_plot 1.3.0"
+SCRIPT_VERSION = "allan_plot 1.4.0"
 
 DEFAULT_CAPTURE_DIR = Path(__file__).resolve().with_name("captures")
 
@@ -117,54 +108,25 @@ class StdoutTee:
         self._file.close()
 
 
-class AllanRecorder(NotifyCallbackFeeddatas):
-    """NotifyCallbackFeeddatas sink: entire feed to CSV, requested channels to
-    a preallocated buffer.
+class AllanRecorder:
+    """A CSV capture plus per-channel buffers for the requested channels.
 
-    Unlike FeedRecorder (list of rows), buffers are per-channel int32 arrays
-    sized from the expected sample count — a 24-hour capture must not hold
-    Python rows in memory. Gaps are counted, not fatal here; the capture loop
-    aborts on them.
+    Unlike the cal recorder (a list of rows), buffers are int32 arrays sized
+    from the expected sample count — a 24-hour capture must not hold Python
+    rows in memory. Dropped samples are NaN rows in the Block: counted,
+    never buffered (the capture loop aborts on them, so the analysis sees a
+    gap-free record).
     """
 
-    COLUMNS = FeedRecorder.COLUMNS  # same CSV format as the cal captures
+    COLUMNS = CsvCapture.COLUMNS
 
-    def __init__(self, file_path, keep_channels, capacity):
-        self.file_path = Path(file_path).resolve()
-        self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = open(self.file_path, "w", newline="")
-        self._writer = None
+    def __init__(self, file_path, keep_channels, capacity, device_dict):
+        self._csv = CsvCapture(file_path, device_dict)
         self._keep = tuple(keep_channels)
         self._buf = {ch: np.empty(capacity, dtype=np.int32) for ch in self._keep}
         self._capacity = capacity
         self._n = 0
-        self._missing = 0
         self.overflowed = False
-
-    def setup(self, device_dict):
-        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        print(f"# captured: {stamp}", file=self._file)
-        print(f"# device: {device_dict}", file=self._file)
-        self._writer = csv.writer(self._file)
-        self._writer.writerow(self.COLUMNS)
-
-    def callback(self, header, feeddatas, missing):
-        if feeddatas:
-            t_ms = round(time.time() * 1000)
-            base = header.sample_sequence_number  # already unwrapped upstream
-            for i, d in enumerate(feeddatas):
-                self._writer.writerow((base + i, t_ms, d.ch0, d.ch1, d.ch2, d.ch3))
-            end = self._n + len(feeddatas)
-            if end > self._capacity:
-                self.overflowed = True
-            else:
-                for ch in self._keep:
-                    self._buf[ch][self._n : end] = [
-                        getattr(d, f"ch{ch}") for d in feeddatas
-                    ]
-                self._n = end
-        self._missing += missing
-        self._file.flush()
 
     @property
     def n_samples(self):
@@ -172,14 +134,25 @@ class AllanRecorder(NotifyCallbackFeeddatas):
 
     @property
     def missing_count(self):
-        return self._missing
+        return self._csv.missing_count
+
+    def add_block(self, block):
+        self._csv.add_block(block)
+        values = block.raw[~np.isnan(block.raw).any(axis=1)]
+        end = self._n + values.shape[0]
+        if end > self._capacity:
+            self.overflowed = True
+            return
+        for ch in self._keep:
+            self._buf[ch][self._n : end] = values[:, ch].astype(np.int32)
+        self._n = end
 
     def window(self, ch, i0, i1):
         """A copy of channel ch samples [i0, i1)."""
         return self._buf[ch][i0:i1].copy()
 
     def cleanup(self):
-        self._file.close()
+        self._csv.close()
 
 
 def channel_list_arg(s: str) -> tuple:
@@ -422,25 +395,21 @@ def make_plots(traces, meta_lines, png_path, no_show):
 async def run(args: argparse.Namespace) -> int:
     channel_sets, kept_channels = plan_capture(args)
 
-    async with await KvsClient.connect(args.address) as dut:
-        info = await check_provisioning(dut, args.board)
+    async with await AsyncDynamiteSampler.connect(args.address) as device:
+        info = check_provisioning(device, args.board)
         if args.tx_power is not None:
             print(f"Setting TX power to {args.tx_power} dBm")
-            await write_characteristic(dut.client, ds.TxPower.TxPowerSet, args.tx_power)
+            await device.set_tx_power(args.tx_power)
         # Always recorded — it's a measurement condition. Read back after the
         # write too: the firmware only logs a failed setPower, nothing comes
-        # back over BLE.
-        tx_power_dbm = await read_characteristic(dut.client, ds.DeviceInfo.TxPowerLevel)
-        if args.tx_power is not None and tx_power_dbm != args.tx_power:
-            raise AllanError(
-                f"TX power readback {tx_power_dbm} dBm != requested {args.tx_power} dBm"
-            )
-        rate = info.adc_config.sample_rate
+        # back over BLE; set_tx_power() already verified the read-back.
+        tx_power_dbm = await device.read_tx_power_dbm()
+        rate = device.sample_rate
         volts_per_count_ch = [
             allan_math.volts_per_count(
                 info.nominals["adc_fsr"], info.nominals["afe_gain"], pga
             )
-            for pga in info.adc_config.gains
+            for pga in info.pga_gains
         ]
 
         cal = None
@@ -451,7 +420,7 @@ async def run(args: argparse.Namespace) -> int:
             print(f"Calibration board on {cal.port}: {cal.fw_id} (uid {cal_uid})")
 
         started = datetime.now(timezone.utc)
-        safe_mac = "".join(c for c in dut.client.address if c.isalnum())
+        safe_mac = "".join(c for c in device.info.address if c.isalnum())
         csv_path = (
             args.capture_dir
             / started.strftime("%Y%m%d")
@@ -468,20 +437,23 @@ async def run(args: argparse.Namespace) -> int:
             capacity = estimate_capacity(
                 rate, args.duration, n_parts, args.guard if channel_sets else 0.0
             )
-            recorder = AllanRecorder(csv_path, kept_channels, capacity)
-            session = FeedSession(
-                dut.client,
-                callbacks_feeddata=[recorder],
-                device_info={
-                    "FirmwareRevision": info.firmware_rev,
-                    "ADCConfig": info.adc_config,
-                    "TxPowerLevel": tx_power_dbm,
+            recorder = AllanRecorder(
+                csv_path,
+                kept_channels,
+                capacity,
+                {
+                    "address": device.info.address,
+                    "name": device.info.name,
+                    "board_model": info.board_model,
+                    "firmware_rev": info.firmware_rev,
+                    "gains": info.pga_gains,
                 },
             )
+            pump = FeedPump(device, recorder)
             try:
-                await session.start()
                 deadline = time.monotonic() + 10.0
                 while recorder.n_samples == 0:
+                    pump.check()
                     if time.monotonic() > deadline:
                         raise AllanError("no ADC feed data within 10 s of subscribing")
                     await asyncio.sleep(0.05)
@@ -536,9 +508,9 @@ async def run(args: argparse.Namespace) -> int:
                                 "temp_c": temp_c,
                             }
                         )
-                await session.stop()
+                await pump.stop()
             finally:
-                await session.stop()  # idempotent
+                await pump.cancel()  # idempotent
                 if cal is not None:
                     cal.close()
 
@@ -566,7 +538,7 @@ async def run(args: argparse.Namespace) -> int:
                 )
             meta_lines = [
                 (
-                    f"Allan deviation — {dut.advertised_name} {dut.client.address} — "
+                    f"Allan deviation — {device.info.name} {device.info.address} — "
                     f"{info.board_model} @ {rate} SPS"
                 ),
                 (
@@ -592,13 +564,6 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
-    # Same constraint as board_calibration.py: the feed pump relies on task
-    # cancellation that 3.11's asyncio.wait_for can swallow.
-    assert sys.version_info >= (
-        3,
-        12,
-    ), f"Python >= 3.12 required, running {sys.version.split()[0]}"
-
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--address",

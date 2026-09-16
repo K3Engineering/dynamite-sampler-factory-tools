@@ -398,7 +398,7 @@ def build_flash_entries(
     "dut,calboard"); temp_dut_c is a placeholder until the DUT sensor is
     plumbed.
     Keys/values are KVS strings; the key/value length limits are enforced by
-    the transport (KvsClient.set), not here.
+    the device's KVS namespace writes, not here.
     """
     now = now or datetime.now(timezone.utc)
     entries = {}

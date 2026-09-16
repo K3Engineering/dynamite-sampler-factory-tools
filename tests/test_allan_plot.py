@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 import allan_plot
+from dynamite_sampler.block import Block
 
 
 def args(**kw):
@@ -55,23 +56,27 @@ def test_plan_flag_combinations_rejected():
         allan_plot.plan_capture(args(use_calboard=True, channels=(0,)))
 
 
-def make_packet(base_ssn, counts):
-    header = SimpleNamespace(sample_sequence_number=base_ssn)
-    # the recorder only needs attribute access, so namespaces stand in for FeedData
-    return header, [
-        SimpleNamespace(ch0=c[0], ch1=c[1], ch2=c[2], ch3=c[3]) for c in counts
-    ]
+def make_block(ssn0, rows):
+    """A raw-unit Block from row tuples; NaN entries mark dropped samples."""
+    raw = np.array(rows, dtype=np.float64)
+    n = raw.shape[0]
+    return Block(
+        data=raw.copy(),
+        raw=raw,
+        t=np.arange(n) / 1000.0,
+        ssn0=ssn0,
+        units="raw",
+        host_time=0.0,
+    )
 
 
 def test_recorder_windows_and_missing(tmp_path):
     rec = allan_plot.AllanRecorder(
-        tmp_path / "cap.csv", keep_channels=(0, 2), capacity=16
+        tmp_path / "cap.csv", keep_channels=(0, 2), capacity=16, device_dict={}
     )
-    rec.setup({})
-    header, feed = make_packet(100, [(1, 9, 5, 9), (2, 9, 6, 9)])
-    rec.callback(header, feed, 0)
-    header, feed = make_packet(102, [(3, 9, 7, 9)])
-    rec.callback(header, feed, 2)  # 2 dropped samples reported
+    rec.add_block(make_block(100, [(1, 9, 5, 9), (2, 9, 6, 9)]))
+    # Two dropped samples occupy ssn 102/103, then the next received sample.
+    rec.add_block(make_block(102, [(np.nan,) * 4, (np.nan,) * 4, (3, 9, 7, 9)]))
     assert rec.n_samples == 3
     assert rec.missing_count == 2
     np.testing.assert_array_equal(rec.window(0, 0, 3), [1, 2, 3])
@@ -80,10 +85,10 @@ def test_recorder_windows_and_missing(tmp_path):
 
 
 def test_recorder_overflow_flags_instead_of_growing(tmp_path):
-    rec = allan_plot.AllanRecorder(tmp_path / "cap.csv", keep_channels=(0,), capacity=2)
-    rec.setup({})
-    header, feed = make_packet(0, [(1, 0, 0, 0), (2, 0, 0, 0), (3, 0, 0, 0)])
-    rec.callback(header, feed, 0)
+    rec = allan_plot.AllanRecorder(
+        tmp_path / "cap.csv", keep_channels=(0,), capacity=2, device_dict={}
+    )
+    rec.add_block(make_block(0, [(1, 0, 0, 0), (2, 0, 0, 0), (3, 0, 0, 0)]))
     assert rec.overflowed
 
 
@@ -138,14 +143,12 @@ def test_stdout_tee(tmp_path):
 
 def test_reduce_excludes_railed_channel(tmp_path):
     rec = allan_plot.AllanRecorder(
-        tmp_path / "cap.csv", keep_channels=(0, 1), capacity=512
+        tmp_path / "cap.csv", keep_channels=(0, 1), capacity=512, device_dict={}
     )
-    rec.setup({})
     rng = np.random.default_rng(0)
     noise = rng.normal(0, 50, 512).astype(int)
     rail = np.full(512, -(1 << 23), dtype=int)
-    header, feed = make_packet(0, list(zip(noise, rail, rail, rail)))
-    rec.callback(header, feed, 0)
+    rec.add_block(make_block(0, list(zip(noise, rail, rail, rail))))
     windows = [{"i0": 0, "i1": rec.n_samples, "dut_channels": (0, 1), "temp_c": None}]
     vpc = [allan_plot.allan_math.volts_per_count(1.2, 101.0, 1)] * 4
     traces = allan_plot.reduce_traces(rec, windows, 1000, vpc)
@@ -158,15 +161,13 @@ def test_reduce_excludes_railed_channel(tmp_path):
 
 def test_make_plots_writes_three_pngs(tmp_path):
     rec = allan_plot.AllanRecorder(
-        tmp_path / "cap.csv", keep_channels=(0, 1), capacity=2048
+        tmp_path / "cap.csv", keep_channels=(0, 1), capacity=2048, device_dict={}
     )
-    rec.setup({})
     rng = np.random.default_rng(0)
     t = np.arange(2048) / 1000.0
     ch0 = (rng.normal(0, 50, 2048) + 40.0 * np.sin(2 * np.pi * 53.333 * t)).astype(int)
     ch1 = rng.normal(0, 50, 2048).astype(int)
-    header, feed = make_packet(0, list(zip(ch0, ch1, ch1, ch1)))
-    rec.callback(header, feed, 0)
+    rec.add_block(make_block(0, list(zip(ch0, ch1, ch1, ch1))))
     windows = [{"i0": 0, "i1": rec.n_samples, "dut_channels": (0, 1), "temp_c": None}]
     vpc = [allan_plot.allan_math.volts_per_count(1.2, 101.0, 1)] * 4
     traces = allan_plot.reduce_traces(rec, windows, 1000, vpc)

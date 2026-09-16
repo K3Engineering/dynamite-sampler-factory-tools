@@ -16,28 +16,19 @@ import sys
 
 from kvs_api_shim import (
     FOLDER_NAMES,
-    NVS_TYPE_STR,
-    KvsClient,
+    AsyncDynamiteSampler,
     KvsError,
     folder_type,
+    namespace,
 )
-from dynamite_sampler import gatt as ds
-from dynamite_sampler_bleak_util import read_characteristic
 
 
-async def dump_namespace(device: KvsClient, folder: str) -> dict[str, str]:
-    """All key/value pairs in a namespace. Only strings are readable over
-    the KVS protocol; other types are shown as placeholders."""
-    out = {}
-    for key, nvs_type in await device.list_entries(folder):
-        if nvs_type == NVS_TYPE_STR:
-            try:
-                out[key] = await device.get(folder, key)
-            except KvsError:
-                out[key] = "<unreadable>"
-        else:
-            out[key] = f"<type {nvs_type:#04x}, not readable over KVS>"
-    return out
+async def dump_namespace(device, folder) -> dict[str, str]:
+    """All key/value pairs in a namespace. String entries come from the
+    snapshot; anything the firmware never writes is flagged."""
+    values = device.kvs.snapshot.get(folder, {})
+    keys = await namespace(device, folder).keys()
+    return {key: values.get(key, "<not a string entry>") for key in keys}
 
 
 def print_pretty(
@@ -61,16 +52,12 @@ def print_pretty(
 
 async def inspect(args: argparse.Namespace) -> int:
     folders = args.folder or list(FOLDER_NAMES)
-    async with await KvsClient.connect(args.address) as device:
+    async with await AsyncDynamiteSampler.connect(args.address) as device:
         device_info = {
-            "address": device.client.address,
-            "name": device.advertised_name,
-            "board_model": await read_characteristic(
-                device.client, ds.DeviceInfo.HardwareRevision
-            ),
-            "firmware_rev": await read_characteristic(
-                device.client, ds.DeviceInfo.FirmwareRevision
-            ),
+            "address": device.info.address,
+            "name": device.info.name,
+            "board_model": device.info.board_model,
+            "firmware_rev": device.info.firmware,
         }
         data = {folder: await dump_namespace(device, folder) for folder in folders}
 

@@ -15,22 +15,8 @@ import argparse
 import asyncio
 import sys
 
-from kvs_api_shim import FOLDER_FACTORY, KvsClient, KvsError
+from kvs_api_shim import UNCONFIGURED, AsyncDynamiteSampler, KvsError
 from nominal_values import BOARD_MODELS, nominal_entries
-from dynamite_sampler import gatt as ds
-from dynamite_sampler_bleak_util import read_characteristic
-
-# What the unified firmware reports in DIS Hardware Revision when it has no
-# usable identity (safe mode).
-SAFE_MODE_IDENTITY = "UNCONFIGURED"
-
-
-async def read_reported_identity(device: KvsClient) -> str:
-    """DIS Hardware Revision: the flashed identity, or 'UNCONFIGURED' in safe mode."""
-    rev = await read_characteristic(device.client, ds.DeviceInfo.HardwareRevision)
-    if not rev:
-        raise KvsError("Could not read the Hardware Revision characteristic")
-    return rev
 
 
 async def provision(args: argparse.Namespace) -> int:
@@ -41,14 +27,16 @@ async def provision(args: argparse.Namespace) -> int:
             print(f"  {key:12s} = {value}")
         return 0
 
-    async with await KvsClient.connect(args.address) as device:
-        reported = await read_reported_identity(device)
-        if reported not in (SAFE_MODE_IDENTITY, args.board):
+    async with await AsyncDynamiteSampler.connect(args.address) as device:
+        # DIS Hardware Revision: the flashed identity, or UNCONFIGURED in
+        # safe mode.
+        reported = device.info.board_model
+        if reported not in (UNCONFIGURED, args.board):
             raise KvsError(
                 f"Device already has a different identity ({reported!r}); "
                 "erase flash to re-provision."
             )
-        needs_reboot = reported == SAFE_MODE_IDENTITY
+        needs_reboot = reported == UNCONFIGURED
         print(
             f"Board model: {args.board} "
             f"({'unconfigured device, writing identity' if needs_reboot else 'matches device identity'})"
@@ -62,12 +50,13 @@ async def provision(args: argparse.Namespace) -> int:
 
         failures = 0
         for key, value in nominal_entries(args.board).items():
-            readback = await device.set_verified(FOLDER_FACTORY, key, value)
-            ok = readback == value
-            failures += not ok
-            print(
-                f"  {key:12s} = {value:20s} {'ok' if ok else f'MISMATCH (read {readback!r})'}"
-            )
+            try:
+                readback = await device.kvs.factory.set(key, value)
+            except KvsError as e:
+                failures += 1
+                print(f"  {key:12s} = {value:20s} MISMATCH ({e})")
+                continue
+            print(f"  {key:12s} = {readback:20s} ok")
 
     if failures:
         print(f"FAILED: {failures} keys did not read back")

@@ -15,32 +15,40 @@ import argparse
 import asyncio
 import sys
 
-from kvs_api_shim import FOLDER_NAMES, KvsClient, KvsError, folder_type
+from kvs_api_shim import (
+    FOLDER_NAMES,
+    AsyncDynamiteSampler,
+    KvsError,
+    folder_type,
+    namespace,
+)
 
 
-async def cmd_get(device: KvsClient, args: argparse.Namespace) -> int:
-    print(await device.get(args.folder, args.key))
+async def cmd_get(device, args: argparse.Namespace) -> int:
+    print(await namespace(device, args.folder).get(args.key))
     return 0
 
 
-async def cmd_set(device: KvsClient, args: argparse.Namespace) -> int:
-    readback = await device.set_verified(
-        args.folder, args.key, args.value, attempts=1
-    )
-    ok = readback == args.value
-    print(f"{args.folder}.{args.key} = {readback} {'ok' if ok else 'MISMATCH'}")
-    return 0 if ok else 1
+async def cmd_set(device, args: argparse.Namespace) -> int:
+    try:
+        readback = await namespace(device, args.folder).set(args.key, args.value)
+    except KvsError as e:
+        print(f"{args.folder}.{args.key}: {e}")
+        return 1
+    print(f"{args.folder}.{args.key} = {readback} ok")
+    return 0
 
 
-async def cmd_del(device: KvsClient, args: argparse.Namespace) -> int:
-    await device.delete(args.folder, args.key)
+async def cmd_del(device, args: argparse.Namespace) -> int:
+    await namespace(device, args.folder).delete(args.key)
     print(f"Deleted {args.folder}.{args.key}")
     return 0
 
 
-async def cmd_clear(device: KvsClient, args: argparse.Namespace) -> int:
+async def cmd_clear(device, args: argparse.Namespace) -> int:
     """Delete every key in the namespace."""
-    keys = await device.keys(args.folder)
+    ns = namespace(device, args.folder)
+    keys = await ns.keys()
     if not keys:
         print(f"{FOLDER_NAMES[args.folder]} namespace is already empty.")
         return 0
@@ -48,7 +56,7 @@ async def cmd_clear(device: KvsClient, args: argparse.Namespace) -> int:
     print(f"{len(keys)} keys in the {FOLDER_NAMES[args.folder]} namespace:")
     for key in keys:
         try:
-            print(f"  {key:12s} = {await device.get(args.folder, key)}")
+            print(f"  {key:12s} = {await ns.get(key)}")
         except KvsError:
             print(f"  {key:12s}   (unreadable)")
 
@@ -59,9 +67,9 @@ async def cmd_clear(device: KvsClient, args: argparse.Namespace) -> int:
             return 2
 
     for key in keys:
-        await device.delete(args.folder, key)
+        await ns.delete(key)
 
-    remaining = await device.keys(args.folder)
+    remaining = await ns.keys()
     if remaining:
         print(f"FAILED: {len(remaining)} keys remain: {', '.join(remaining)}")
         return 1
@@ -105,7 +113,7 @@ def main() -> None:
     args = parser.parse_args()
 
     async def run() -> int:
-        async with await KvsClient.connect(args.address) as device:
+        async with await AsyncDynamiteSampler.connect(args.address) as device:
             return await args.func(device, args)
 
     try:
