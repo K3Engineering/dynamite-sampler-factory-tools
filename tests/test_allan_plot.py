@@ -70,9 +70,21 @@ def make_block(ssn0, rows):
     )
 
 
+def fake_device():
+    """The attributes CsvRecorder reads off a device."""
+    return SimpleNamespace(
+        sample_rate=1000,
+        gains=[1, 1, 1, 1],
+        kvs=SimpleNamespace(snapshot={"F": {}, "U": {}}),
+        info=None,
+        tare_raw=None,
+    )
+
+
 def test_recorder_windows_and_missing(tmp_path):
+    path = tmp_path / "cap.csv"
     rec = allan_plot.AllanRecorder(
-        tmp_path / "cap.csv", keep_channels=(0, 2), capacity=16, device_dict={}
+        fake_device(), path, keep_channels=(0, 2), capacity=16
     )
     rec.add_block(make_block(100, [(1, 9, 5, 9), (2, 9, 6, 9)]))
     # Two dropped samples occupy ssn 102/103, then the next received sample.
@@ -83,10 +95,17 @@ def test_recorder_windows_and_missing(tmp_path):
     np.testing.assert_array_equal(rec.window(2, 1, 3), [6, 7])
     rec.cleanup()
 
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "# dynamite-csv 1"
+    body = [row for row in lines if row and not row.startswith("#")][1:]  # skip header
+    assert body[0].split(",")[0] == "100"
+    assert body[2].startswith("102,,")  # the first dropped row is written blank
+    assert body[4].startswith("104,3,")
+
 
 def test_recorder_overflow_flags_instead_of_growing(tmp_path):
     rec = allan_plot.AllanRecorder(
-        tmp_path / "cap.csv", keep_channels=(0,), capacity=2, device_dict={}
+        fake_device(), tmp_path / "cap.csv", keep_channels=(0,), capacity=2
     )
     rec.add_block(make_block(0, [(1, 0, 0, 0), (2, 0, 0, 0), (3, 0, 0, 0)]))
     assert rec.overflowed
@@ -143,7 +162,7 @@ def test_stdout_tee(tmp_path):
 
 def test_reduce_excludes_railed_channel(tmp_path):
     rec = allan_plot.AllanRecorder(
-        tmp_path / "cap.csv", keep_channels=(0, 1), capacity=512, device_dict={}
+        fake_device(), tmp_path / "cap.csv", keep_channels=(0, 1), capacity=512
     )
     rng = np.random.default_rng(0)
     noise = rng.normal(0, 50, 512).astype(int)
@@ -161,7 +180,7 @@ def test_reduce_excludes_railed_channel(tmp_path):
 
 def test_make_plots_writes_three_pngs(tmp_path):
     rec = allan_plot.AllanRecorder(
-        tmp_path / "cap.csv", keep_channels=(0, 1), capacity=2048, device_dict={}
+        fake_device(), tmp_path / "cap.csv", keep_channels=(0, 1), capacity=2048
     )
     rng = np.random.default_rng(0)
     t = np.arange(2048) / 1000.0

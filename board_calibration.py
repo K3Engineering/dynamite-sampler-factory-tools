@@ -4,13 +4,15 @@ Flow:
   1. Connect to the DUT over BLE; read the provisioning (board model,
      nominals) and the ADC's PGA configuration.
   2. Connect to the calibration board (USB serial, raw REPL via mpremote).
-  3. Stream the entire ADC feed to CSV while stepping the cal board through a
-     zero-anchored reversal sweep in two phases — channels 1+3, then 2+4
-     (channels sharing a divider bridge can't be driven simultaneously).
+  3. Stream the entire ADC feed to a dynamite-csv file while stepping the
+     cal board through a zero-anchored reversal sweep in two phases —
+     channels 1+3, then 2+4 (channels sharing a divider bridge can't be
+     driven simultaneously).
   4. Segment the capture per commanded state (guard + dwell around SSN
      windows), compute the five per-config means per channel, run the gates.
-  5. On pass: write ch{i}.r / ch{i}.raw / cal.* to the Factory namespace
-     (read-back verified) and log everything to the factory DB.
+  5. On pass: write ch{i}.r / ch{i}.raw / cal.* as one batch to the Factory
+     namespace (read-back verified, one calibration rebuild) and log
+     everything to the factory DB.
      On any gate failure: abort loudly, write nothing (DB + CSV remain).
 
 Usage:
@@ -27,19 +29,23 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
 from kvs_api_shim import (
     KVS_WRITE_DELAY_S,
     AsyncDynamiteSampler,
+    CsvRecorder,
+    DynamiteError,
     KvsError,
 )
-from capture import CsvCapture, FeedPump
+from capture import FeedPump
 
 import cal_math
 import db
 from calboard_driver import CalBoard, CalBoardError
 from nominal_values import BOARD_MODELS
 
-SCRIPT_VERSION = "board_calibration 1.3"
+SCRIPT_VERSION = "board_calibration 2.0"
 
 # TODO: read the DUT's onboard temperature sensor and plumb it through
 # (cal.temp dut field, segments table). Placeholder until then.
@@ -58,47 +64,50 @@ PHASES = ((1, 3), (2, 4))
 
 
 class FeedRecorder:
-    """A CSV capture plus the received rows, for SSN-window slicing."""
+    """A dynamite-csv capture plus the received rows, for SSN-window slicing."""
 
-    def __init__(self, file_path, device_dict):
-        self._csv = CsvCapture(file_path, device_dict)
+    def __init__(self, device, file_path):
+        self._recorder = CsvRecorder(device, file_path, units="raw")
         self._rows = []
+        self._last_ssn = None
 
     @property
     def last_ssn(self):
         """Highest unwrapped SSN seen (including dropped ones)."""
-        return self._csv.last_ssn
+        return self._last_ssn
 
     @property
     def rows(self):
         return self._rows
 
     def add_block(self, block):
-        self._rows.extend(self._csv.add_block(block))
+        self._recorder.write(block)
+        self._last_ssn = block.ssn0 + len(block) - 1
+        t_ms = round(time.time() * 1000)
+        for i, row in enumerate(block.raw):
+            if not np.isnan(row).any():
+                self._rows.append((block.ssn0 + int(i), t_ms, *(int(v) for v in row)))
 
     def window(self, ssn_start, ssn_end):
         """Received rows with ssn_start <= ssn <= ssn_end."""
         return [r for r in self._rows if ssn_start <= r[0] <= ssn_end]
 
     def cleanup(self):
-        self._csv.close()
+        self._recorder.close()
 
 
 def read_flash_nominals(device) -> dict[str, float]:
-    """The provisioned analog nominals from flash (provenance stripped).
-
-    Values follow the '<number>[,provenance]' scalar grammar of
-    docs/flash-schema-v2.md (repo root)."""
-    factory = device.kvs.snapshot.get("F", {})
-    out = {}
-    for key in ("adc_fsr", "exc", "afe_gain"):
-        raw = factory.get(key)
-        if raw is None:
-            raise KvsError(
-                f"{key!r} not provisioned — run flash_factory_nominals.py first"
-            )
-        out[key] = float(raw.split(",")[0].strip())
-    return out
+    """The provisioned analog nominals (parsed at connect; this renames)."""
+    nominals = device.calibration.nominals
+    if nominals is None:
+        raise KvsError(
+            "board constants not provisioned — run flash_factory_nominals.py first"
+        )
+    return {
+        "adc_fsr": nominals.adc_fsr_v,
+        "exc": nominals.excitation_v,
+        "afe_gain": nominals.afe_gain,
+    }
 
 
 @dataclass
@@ -214,19 +223,14 @@ def reduce_segments(
     return segments
 
 
-async def write_entries(device, entries: dict[str, str]) -> int:
-    """Write calibration entries to the Factory namespace (read-back verified).
-    Returns the number of mismatched keys."""
-    mismatches = 0
+async def write_entries(device, entries: dict[str, str]) -> None:
+    """Write the calibration group to the Factory namespace as one batch:
+    per-key read-back verify, one calibration rebuild at the end. Any
+    failure raises — a partial group must not stand."""
     for key, value in entries.items():
-        try:
-            await device.kvs.factory.set(key, value)
-        except KvsError as e:
-            mismatches += 1
-            print(f"  {key:12s} = {value:56s} MISMATCH ({e})")
-            continue
-        print(f"  {key:12s} = {value:56s} ok")
-    return mismatches
+        print(f"  {key:12s} = {value}")
+    await device.kvs.factory.set_many(entries)
+    print(f"{len(entries)} keys written and verified.")
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -286,16 +290,7 @@ async def run(args: argparse.Namespace) -> int:
         )
         print(f"Run #{run_id}: capture -> {csv_path}")
 
-        recorder = FeedRecorder(
-            csv_path,
-            {
-                "address": device.info.address,
-                "name": device.info.name,
-                "board_model": dut_info.board_model,
-                "firmware_rev": dut_info.firmware_rev,
-                "gains": dut_info.pga_gains,
-            },
-        )
+        recorder = FeedRecorder(device, csv_path)
         pump = FeedPump(device, recorder, blocksize=FEED_BLOCK_ROWS)
         try:
             deadline = time.monotonic() + 10.0
@@ -362,10 +357,11 @@ async def run(args: argparse.Namespace) -> int:
                     print(f"  {key:12s} = {value}")
                 return 0
 
-            mismatches = await write_entries(device, entries)
-            if mismatches:
-                db.finish_run(con, run_id, "fail", f"{mismatches} keys misverified")
-                print(f"FAILED: {mismatches} of {len(entries)} keys did not read back")
+            try:
+                await write_entries(device, entries)
+            except DynamiteError as e:
+                db.finish_run(con, run_id, "fail", f"group write failed: {e}")
+                print(f"FAILED writing the calibration group: {e}")
                 return 1
 
             log_id = db.log_calibration(

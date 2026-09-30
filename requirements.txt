@@ -3,3 +3,4 @@ mpremote
 pyserial
 numpy
 matplotlib
+pyyaml

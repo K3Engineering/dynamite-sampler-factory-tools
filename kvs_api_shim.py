@@ -17,6 +17,7 @@ sys.path.insert(0, str(_PYTHON_API / "src"))
 from dynamite_sampler import (  # noqa: E402
     UNCONFIGURED,
     AsyncDynamiteSampler,
+    CsvRecorder,
     DynamiteError,
     KvsBusy,
     KvsError,
@@ -34,6 +35,7 @@ from dynamite_sampler.kvs import (  # noqa: E402
 __all__ = [
     "UNCONFIGURED",
     "AsyncDynamiteSampler",
+    "CsvRecorder",
     "DynamiteError",
     "KvsBusy",
     "KvsError",

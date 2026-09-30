@@ -4,8 +4,8 @@ Flow:
   1. Connect to the DUT over BLE; read the provisioning (board model,
      nominals) and the ADC config (sample rate, per-channel PGA).
      Optionally, connect to the calibration board and set up shorts
-  2. Record a contiguous capture to CSV. A single dropped sample aborts the
-      run — Allan math requires a gap-free record.
+  2. Record a contiguous capture to a dynamite-csv file. A single dropped
+      sample aborts the run — Allan math requires a gap-free record.
      3. Per channel: overlapping Allan deviation on an 8-points/octave tau grid,
       converted to nV referred to the AFE input, plus a Hann amplitude
       spectrum and a Welch amplitude spectral density. Narrowband peaks
@@ -53,15 +53,15 @@ from pathlib import Path
 
 import numpy as np
 
-from kvs_api_shim import AsyncDynamiteSampler, KvsError
-from capture import CsvCapture, FeedPump
+from kvs_api_shim import AsyncDynamiteSampler, CsvRecorder, KvsError
+from capture import FeedPump
 
 import allan_math
 from board_calibration import PHASES, check_provisioning
 from calboard_driver import CalBoard, CalBoardError
 from nominal_values import BOARD_MODELS
 
-SCRIPT_VERSION = "allan_plot 1.4.0"
+SCRIPT_VERSION = "allan_plot 2.0.0"
 
 DEFAULT_CAPTURE_DIR = Path(__file__).resolve().with_name("captures")
 
@@ -109,23 +109,23 @@ class StdoutTee:
 
 
 class AllanRecorder:
-    """A CSV capture plus per-channel buffers for the requested channels.
+    """A dynamite-csv capture plus per-channel buffers for the requested
+    channels.
 
     Unlike the cal recorder (a list of rows), buffers are int32 arrays sized
     from the expected sample count — a 24-hour capture must not hold Python
-    rows in memory. Dropped samples are NaN rows in the Block: counted,
-    never buffered (the capture loop aborts on them, so the analysis sees a
-    gap-free record).
+    rows in memory. Dropped samples are counted, never buffered (the capture
+    loop aborts on them, so the analysis sees a gap-free record); in the
+    file they are blank rows.
     """
 
-    COLUMNS = CsvCapture.COLUMNS
-
-    def __init__(self, file_path, keep_channels, capacity, device_dict):
-        self._csv = CsvCapture(file_path, device_dict)
+    def __init__(self, device, file_path, keep_channels, capacity):
+        self._recorder = CsvRecorder(device, file_path, units="raw")
         self._keep = tuple(keep_channels)
         self._buf = {ch: np.empty(capacity, dtype=np.int32) for ch in self._keep}
         self._capacity = capacity
         self._n = 0
+        self._missing = 0
         self.overflowed = False
 
     @property
@@ -134,11 +134,13 @@ class AllanRecorder:
 
     @property
     def missing_count(self):
-        return self._csv.missing_count
+        return self._missing
 
     def add_block(self, block):
-        self._csv.add_block(block)
-        values = block.raw[~np.isnan(block.raw).any(axis=1)]
+        self._recorder.write(block)
+        valid = ~np.isnan(block.raw).any(axis=1)
+        self._missing += int((~valid).sum())
+        values = block.raw[valid]
         end = self._n + values.shape[0]
         if end > self._capacity:
             self.overflowed = True
@@ -152,7 +154,7 @@ class AllanRecorder:
         return self._buf[ch][i0:i1].copy()
 
     def cleanup(self):
-        self._csv.close()
+        self._recorder.close()
 
 
 def channel_list_arg(s: str) -> tuple:
@@ -437,18 +439,7 @@ async def run(args: argparse.Namespace) -> int:
             capacity = estimate_capacity(
                 rate, args.duration, n_parts, args.guard if channel_sets else 0.0
             )
-            recorder = AllanRecorder(
-                csv_path,
-                kept_channels,
-                capacity,
-                {
-                    "address": device.info.address,
-                    "name": device.info.name,
-                    "board_model": info.board_model,
-                    "firmware_rev": info.firmware_rev,
-                    "gains": info.pga_gains,
-                },
-            )
+            recorder = AllanRecorder(device, csv_path, kept_channels, capacity)
             pump = FeedPump(device, recorder)
             try:
                 deadline = time.monotonic() + 10.0
