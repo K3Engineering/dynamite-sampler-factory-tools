@@ -15,6 +15,10 @@ Flow:
      everything to the factory DB.
      On any gate failure: abort loudly, write nothing (DB + CSV remain).
 
+A failed group write can leave a torn group behind, and Factory is
+append-only over BLE — recovery is an off-BLE flash erase
+(idf.py erase-flash + reflash firmware + re-provision).
+
 Usage:
     python board_calibration.py [--address AA:BB:CC:DD:EE:FF] [--cal-port COM5]
                                 [--dwell 1.0] [--guard 0.4] [--dry-run]

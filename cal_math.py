@@ -1,7 +1,7 @@
 """Calibration math for the factory board calibration.
 
 Pure functions and data — no I/O, no BLE, no serial. The storage format this
-produces is specified in docs/flash-schema-v1.md (repo root).
+produces is specified in docs/flash-schema-v2.md (repo root).
 
 The stimulus is the calibration board's resistor ladder, powered by the DUT's
 own excitation (ratiometric: only resistor ratios matter):
@@ -55,7 +55,7 @@ MV_TO_CONFIG = {
 SWEEP_SEQUENCE_MV = (0, 5, 10, 5, 0, -5, -10, -5, 0)
 
 # Provenance tag for the ladder resistors while no per-board characterization
-# exists (see docs/flash-schema-v1.md).
+# exists (see docs/flash-schema-v2.md).
 PROVENANCE_NOMINAL = "nominal"
 
 

@@ -1,8 +1,9 @@
 """Targeted edits to flash contents (dev tool).
 
 Get/set/delete individual keys, or clear a whole namespace, in any of the
-KVS folders (Factory, User, Settings). For read-only dumps use
-inspect_flash.py.
+KVS folders (Factory, User, Settings). Factory is append-only over BLE: a
+SET works only on an absent key, DEL is always rejected. For read-only
+dumps use inspect_flash.py.
 
 Usage:
     python edit_flash.py get F exc

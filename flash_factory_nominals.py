@@ -3,9 +3,12 @@
 Run after firmware flashing, before calibration. With unified firmware,
 --board is mandatory, and `board_model` is written to the Factory namespace.
 
-If the device already carries a different identity, the script refuses to
-proceed; erase flash to re-provision. To wipe the Factory namespace instead,
-use edit_flash.py.
+The Factory namespace is append-only over BLE (the firmware rejects a SET
+for a populated key and every DEL). The writes are therefore one-shot: if
+the device already carries a different identity, or a run dies after
+writing some keys, provisioning cannot be corrected over BLE — erase the
+flash over USB (idf.py erase-flash), reflash the firmware, and provision
+from scratch.
 
 Usage:
     python flash_factory_nominals.py --board v700P [--address AA:BB:CC:DD:EE:FF] [--dry-run]
