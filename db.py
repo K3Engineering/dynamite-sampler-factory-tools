@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS runs (
     csv_path TEXT,
     dwell_s REAL,
     guard_s REAL,
+    namespace TEXT NOT NULL,  -- factory/user (cal group target)
     result TEXT NOT NULL DEFAULT 'running',  -- running/pass/fail/dry-run/aborted
     fail_reason TEXT,
     script TEXT NOT NULL
@@ -58,7 +59,9 @@ CREATE TABLE IF NOT EXISTS calibrations (
     device_name TEXT,
     board_model TEXT,
     firmware_rev TEXT,
+    namespace TEXT NOT NULL,  -- factory/user (cal group written)
     keys_written TEXT NOT NULL,  -- JSON object: {factory key: value}
+    delta TEXT,                  -- JSON {dut_ch: [new-prior counts]}, user runs only
     script TEXT NOT NULL,
     run_id INTEGER REFERENCES runs(id)
 )
@@ -81,8 +84,8 @@ def insert_run(con: sqlite3.Connection, record: dict) -> int:
         "INSERT INTO runs"
         " (ts_utc, device_address, device_name, board_model, firmware_rev,"
         "  cal_board_id, cal_board_uid, cal_port,"
-        "  csv_path, dwell_s, guard_s, script)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "  csv_path, dwell_s, guard_s, namespace, script)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             record["ts_utc"],
             record["device_address"],
@@ -95,6 +98,7 @@ def insert_run(con: sqlite3.Connection, record: dict) -> int:
             record.get("csv_path"),
             record.get("dwell_s"),
             record.get("guard_s"),
+            record["namespace"],
             record["script"],
         ),
     )
@@ -149,15 +153,17 @@ def log_calibration(con: sqlite3.Connection, record: dict) -> int:
     cur = con.execute(
         "INSERT INTO calibrations"
         " (ts_utc, device_address, device_name, board_model, firmware_rev,"
-        "  keys_written, script, run_id)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "  namespace, keys_written, delta, script, run_id)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             record["ts_utc"],
             record["device_address"],
             record.get("device_name"),
             record.get("board_model"),
             record.get("firmware_rev"),
+            record["namespace"],
             json.dumps(record["keys_written"]),
+            None if record.get("delta") is None else json.dumps(record["delta"]),
             record["script"],
             record.get("run_id"),
         ),

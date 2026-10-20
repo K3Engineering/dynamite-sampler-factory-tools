@@ -247,6 +247,9 @@ def test_build_flash_entries_roundtrip():
         now=__import__("datetime").datetime(
             2026, 8, 7, tzinfo=__import__("datetime").timezone.utc
         ),
+        tool="board_calibration 1.0",
+        origin="factory",
+        adc_gains=[1, 1, 1, 1],
         temp_dut_c=-999.0,
         temp_calboard_c=23.4375,
     )
@@ -256,6 +259,9 @@ def test_build_flash_entries_roundtrip():
         "cal.board",
         "cal.r.prov",
         "cal.temp",
+        "cal.tool",
+        "cal.origin",
+        "cal.adc",
     }
     raw = [float(v) for v in entries["ch0.raw"].split(",")]
     assert len(raw) == cal_math.CAL_POINT_COUNT
@@ -286,10 +292,3 @@ def test_build_flash_entries_provenance_keys():
     for key, value in entries.items():
         assert len(key) <= 15
         assert len(value) <= 128
-
-    # Absent provenance: no keys stamped (older readers see the old layout).
-    bare = cal_math.build_flash_entries(
-        readings, "x", temp_dut_c=-999.0, temp_calboard_c=23.0
-    )
-    for key in ("cal.tool", "cal.origin", "cal.adc"):
-        assert key not in bare

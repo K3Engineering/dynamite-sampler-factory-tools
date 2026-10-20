@@ -383,10 +383,10 @@ def build_flash_entries(
     now=None,
     resistors=NOMINAL_LADDER_RESISTORS,
     r_provenance=PROVENANCE_NOMINAL,
-    tool=None,
-    origin=None,
-    adc_gains=None,
     *,
+    tool,
+    origin,
+    adc_gains,
     temp_dut_c,
     temp_calboard_c,
 ):
@@ -394,6 +394,7 @@ def build_flash_entries(
 
     readings: {dut_ch: [5 config means, storage order]} for all 4 channels.
     tool: host script version (cal.tool). origin: e.g. "factory" (cal.origin).
+    adc_gains: per-channel PGA gains at calibration (cal.adc).
     temp_dut_c/temp_calboard_c: temperatures at calibration (cal.temp,
     "dut,calboard"); temp_dut_c is a placeholder until the DUT sensor is
     plumbed.
@@ -409,10 +410,7 @@ def build_flash_entries(
     entries["cal.board"] = cal_board_id
     entries["cal.r.prov"] = r_provenance
     entries["cal.temp"] = f"{_fmt(temp_dut_c)},{_fmt(temp_calboard_c)}"
-    if tool is not None:
-        entries["cal.tool"] = tool
-    if origin is not None:
-        entries["cal.origin"] = origin
-    if adc_gains is not None:
-        entries["cal.adc"] = ",".join(_fmt(g) for g in adc_gains)
+    entries["cal.tool"] = tool
+    entries["cal.origin"] = origin
+    entries["cal.adc"] = ",".join(_fmt(g) for g in adc_gains)
     return entries

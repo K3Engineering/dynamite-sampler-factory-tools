@@ -10,17 +10,22 @@ Flow:
      driven simultaneously).
   4. Segment the capture per commanded state (guard + dwell around SSN
      windows), compute the five per-config means per channel, run the gates.
-  5. On pass: write ch{i}.r / ch{i}.raw / cal.* as one batch to the Factory
+  5. On pass: write ch{i}.r / ch{i}.raw / cal.* as one batch to the chosen
      namespace (read-back verified, one calibration rebuild) and log
      everything to the factory DB.
      On any gate failure: abort loudly, write nothing (DB + CSV remain).
 
-A failed group write can leave a torn group behind, and Factory is
-append-only over BLE — recovery is an off-BLE flash erase
-(idf.py erase-flash + reflash firmware + re-provision).
+The Factory namespace holds the as-built calibration and is write-once over
+BLE, so a failed group write there can leave a torn group behind — recovery
+is an off-BLE flash erase (idf.py erase-flash + reflash firmware +
+re-provision). The User namespace holds a recalibration that overrides the
+Factory group (--namespace user): it is overwritable, the rewrite drops the
+cal.date marker first and writes it last, and an interrupted rewrite reads
+as torn (readers fall back to Factory only when no User group keys exist).
 
 Usage:
     python board_calibration.py [--address AA:BB:CC:DD:EE:FF] [--cal-port COM5]
+                                [--namespace factory|user] [--origin TAG]
                                 [--dwell 1.0] [--guard 0.4] [--dry-run]
 """
 
@@ -49,11 +54,21 @@ import db
 from calboard_driver import CalBoard, CalBoardError
 from nominal_values import BOARD_MODELS
 
-SCRIPT_VERSION = "board_calibration 2.0"
+SCRIPT_VERSION = "board_calibration 2.1"
 
 # TODO: read the DUT's onboard temperature sensor and plumb it through
 # (cal.temp dut field, segments table). Placeholder until then.
 DUT_TEMP_PLACEHOLDER_C = -999.0
+
+# Namespace the cal group is written to. User holds a recalibration that
+# overrides the factory group; see docs/flash-schema-v2.md.
+NAMESPACE_FACTORY = "factory"
+NAMESPACE_USER = "user"
+
+# The group's presence marker: deleted first and written last on a User
+# rewrite, so an interrupted write reads as torn rather than as a mix of old
+# and new channel data.
+CAL_GROUP_MARKER = "cal.date"
 
 DEFAULT_DB_PATH = Path(__file__).resolve().with_name("factory_log.db")
 DEFAULT_CAPTURE_DIR = Path(__file__).resolve().with_name("captures")
@@ -227,14 +242,59 @@ def reduce_segments(
     return segments
 
 
-async def write_entries(device, entries: dict[str, str]) -> None:
-    """Write the calibration group to the Factory namespace as one batch:
+def prior_readings(device) -> dict[int, list[float]] | None:
+    """The effective calibration's per-channel readings before this run, or
+    None when the board had none. User overrides Factory, as in every other
+    reader."""
+    group = device.calibration.group
+    if group is None:
+        return None
+    return {
+        dut_ch: list(readings)
+        for dut_ch, readings in enumerate(group.readings)
+        if readings is not None
+    }
+
+
+def readings_delta(readings, prior) -> dict[int, list[float]] | None:
+    """Per-channel, per-config new-minus-prior readings in counts; None when
+    there was no prior calibration to compare against."""
+    if prior is None:
+        return None
+    return {
+        dut_ch: [new - old for new, old in zip(readings[dut_ch], prior[dut_ch])]
+        for dut_ch in sorted(readings.keys() & prior.keys())
+    }
+
+
+def print_delta(delta) -> None:
+    """The user recalibration's movement vs the calibration it overrides."""
+    if delta is None:
+        print("No prior calibration to compare against.")
+        return
+    print("Delta vs the previous calibration (new - prior, counts):")
+    for dut_ch, values in delta.items():
+        print(f"  ch{dut_ch}: " + " ".join(f"{v:+9.0f}" for v in values))
+
+
+async def write_entries(device, entries: dict[str, str], namespace: str) -> None:
+    """Write the calibration group to the chosen namespace as one batch:
     per-key read-back verify, one calibration rebuild at the end. Any
-    failure raises — a partial group must not stand."""
+    failure raises — a partial group must not stand.
+
+    Factory is append-only (write-once per key), so its entries can only be
+    written in place. User is overwritable, so the group is written marker-
+    first-deleted and marker-last (set_group): a crash mid-rewrite leaves a
+    torn group that readers reject, never a valid-looking old/new mix.
+    """
     for key, value in entries.items():
         print(f"  {key:12s} = {value}")
-    await device.kvs.factory.set_many(entries)
-    print(f"{len(entries)} keys written and verified.")
+    target = device.kvs.user if namespace == NAMESPACE_USER else device.kvs.factory
+    if namespace == NAMESPACE_USER:
+        await target.set_group(entries, marker=CAL_GROUP_MARKER)
+    else:
+        await target.set_many(entries)
+    print(f"{len(entries)} keys written to {namespace} and verified.")
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -252,6 +312,7 @@ async def run(args: argparse.Namespace) -> int:
     async with await AsyncDynamiteSampler.connect(args.address) as device:
         dut_info = check_provisioning(device, args.board)
         nominals = dut_info.nominals
+        prior = prior_readings(device)
 
         cal = await asyncio.to_thread(CalBoard.connect, args.cal_port)
         cal_uid = f"{await asyncio.to_thread(cal.unique_id):012X}"
@@ -289,6 +350,7 @@ async def run(args: argparse.Namespace) -> int:
                 "csv_path": str(csv_path),
                 "dwell_s": args.dwell,
                 "guard_s": args.guard,
+                "namespace": args.namespace,
                 "script": SCRIPT_VERSION,
             },
         )
@@ -339,13 +401,14 @@ async def run(args: argparse.Namespace) -> int:
                 return 1
 
             readings = cal_math.final_readings(config_values)
+            delta = readings_delta(readings, prior)
             temp_calboard_mean = statistics.fmean(seg.temp_c for seg in segments)
             entries = cal_math.build_flash_entries(
                 readings,
                 cal.fw_id,
                 now=started,
                 tool=SCRIPT_VERSION,
-                origin="factory",
+                origin=args.origin,
                 adc_gains=dut_info.pga_gains,
                 temp_dut_c=DUT_TEMP_PLACEHOLDER_C,
                 temp_calboard_c=temp_calboard_mean,
@@ -353,16 +416,18 @@ async def run(args: argparse.Namespace) -> int:
             print("Gates passed. Calibration readings (raw counts, storage order):")
             for dut_ch in range(4):
                 print(f"  ch{dut_ch}: {entries[f'ch{dut_ch}.raw']}")
+            if args.namespace == NAMESPACE_USER:
+                print_delta(delta)
 
             if args.dry_run:
                 db.finish_run(con, run_id, "dry-run")
-                print("Dry run — would write to the Factory namespace:")
+                print(f"Dry run — would write to the {args.namespace} namespace:")
                 for key, value in entries.items():
                     print(f"  {key:12s} = {value}")
                 return 0
 
             try:
-                await write_entries(device, entries)
+                await write_entries(device, entries, args.namespace)
             except DynamiteError as e:
                 db.finish_run(con, run_id, "fail", f"group write failed: {e}")
                 print(f"FAILED writing the calibration group: {e}")
@@ -376,7 +441,9 @@ async def run(args: argparse.Namespace) -> int:
                     "device_name": device.info.name,
                     "board_model": dut_info.board_model,
                     "firmware_rev": dut_info.firmware_rev,
+                    "namespace": args.namespace,
                     "keys_written": entries,
+                    "delta": delta,
                     "script": SCRIPT_VERSION,
                     "run_id": run_id,
                 },
@@ -407,6 +474,18 @@ def main() -> None:
     parser.add_argument(
         "--cal-port",
         help="serial port of the calibration board (default: probe plausible ports)",
+    )
+    parser.add_argument(
+        "--namespace",
+        choices=(NAMESPACE_FACTORY, NAMESPACE_USER),
+        default=NAMESPACE_FACTORY,
+        help="calibration namespace (default: %(default)s). 'user' writes a "
+        "recalibration to the User namespace, which overrides the factory "
+        "group; it replaces any prior User group",
+    )
+    parser.add_argument(
+        "--origin",
+        help="value for cal.origin (default: the namespace name)",
     )
     parser.add_argument(
         "--db",
@@ -448,6 +527,8 @@ def main() -> None:
     gates.add_argument("--span-tol", type=float, default=0.10)
     gates.add_argument("--max-temp-spread-c", type=float, default=0.2)
     args = parser.parse_args()
+    if args.origin is None:
+        args.origin = args.namespace
 
     try:
         sys.exit(asyncio.run(run(args)))
