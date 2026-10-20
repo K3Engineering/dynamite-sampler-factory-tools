@@ -18,7 +18,7 @@ import argparse
 import asyncio
 import sys
 
-from kvs_api_shim import UNCONFIGURED, AsyncDynamiteSampler, KvsError
+from kvs_api_shim import UNCONFIGURED, AsyncDynamiteSampler, DynamiteError, KvsError
 from nominal_values import BOARD_MODELS, nominal_entries
 
 
@@ -51,19 +51,13 @@ async def provision(args: argparse.Namespace) -> int:
                 print(f"  {key:12s} = {value}")
             return 0
 
-        failures = 0
-        for key, value in nominal_entries(args.board).items():
-            try:
-                readback = await device.kvs.factory.set(key, value)
-            except KvsError as e:
-                failures += 1
-                print(f"  {key:12s} = {value:20s} MISMATCH ({e})")
-                continue
-            print(f"  {key:12s} = {readback:20s} ok")
+        # One batch: the device-side constants are all-or-none, and a
+        # key-by-key set would rebuild the calibration against a torn group.
+        entries = nominal_entries(args.board)
+        await device.kvs.factory.set_many(entries)
+        for key, value in entries.items():
+            print(f"  {key:12s} = {value:20s} ok")
 
-    if failures:
-        print(f"FAILED: {failures} keys did not read back")
-        return 1
     print(f"Factory nominals for {args.board} provisioned and verified.")
     if needs_reboot:
         print("Reboot the device for the new identity to take effect.")
@@ -91,7 +85,9 @@ def main() -> None:
 
     try:
         sys.exit(asyncio.run(provision(args)))
-    except KvsError as e:
+    except DynamiteError as e:
+        # Covers KvsError (rejected writes...) and CalibrationError: a board
+        # with torn provisioning constants fails already at connect().
         print(f"error: {e}", file=sys.stderr)
         sys.exit(2)
 
