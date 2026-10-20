@@ -59,7 +59,6 @@ from capture import FeedPump
 import allan_math
 from board_calibration import PHASES, check_provisioning
 from calboard_driver import CalBoard, CalBoardError
-from nominal_values import BOARD_MODELS
 
 SCRIPT_VERSION = "allan_plot 2.0.0"
 
@@ -398,7 +397,7 @@ async def run(args: argparse.Namespace) -> int:
     channel_sets, kept_channels = plan_capture(args)
 
     async with await AsyncDynamiteSampler.connect(args.address) as device:
-        info = check_provisioning(device, args.board)
+        info = check_provisioning(device)
         if args.tx_power is not None:
             print(f"Setting TX power to {args.tx_power} dBm")
             await device.set_tx_power(args.tx_power)
@@ -559,11 +558,6 @@ def main() -> None:
     parser.add_argument(
         "--address",
         help="BLE address of the DUT (default: auto-detect, only one may be in range)",
-    )
-    parser.add_argument(
-        "--board",
-        choices=sorted(BOARD_MODELS),
-        help="board model (default: read from the provisioned Factory namespace)",
     )
     parser.add_argument(
         "--tx-power",

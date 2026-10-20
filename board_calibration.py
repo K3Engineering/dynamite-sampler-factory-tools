@@ -139,29 +139,19 @@ class DutInfo:
     nominals: dict[str, float]
 
 
-def check_provisioning(device, board_override: str | None) -> DutInfo:
-    """Read identity + analog nominals, cross-checked against the firmware's
-    hardware revision."""
+def check_provisioning(device) -> DutInfo:
+    """Read the identity the firmware booted with + the analog nominals.
+
+    The identity is the DIS Hardware Revision, which the firmware derives from
+    the provisioned ``board_model`` at boot; an unprovisioned board never
+    reaches the ADC, so there is nothing to fall back to here."""
+
     if device.sample_rate is None:
         raise KvsError("device is UNCONFIGURED (safe mode); the ADC is disabled")
 
-    board_model = board_override
-    if board_model is None:
-        board_model = device.kvs.snapshot.get("F", {}).get("board_model")
-        if not board_model:
-            raise KvsError(
-                "board_model not provisioned — run flash_factory_nominals.py "
-                "first (or pass --board)"
-            )
+    board_model = device.info.board_model
     if board_model not in BOARD_MODELS:
         raise KvsError(f"unknown board model {board_model!r}")
-    reported = device.info.board_model
-    if reported != board_model:
-        raise KvsError(
-            f"provisioned board_model {board_model!r} does not match the "
-            f"firmware's Hardware Revision {reported!r} — wrong unit or bad "
-            "provisioning"
-        )
     return DutInfo(
         device.info.firmware,
         device.gains,
@@ -310,7 +300,7 @@ async def run(args: argparse.Namespace) -> int:
     )
 
     async with await AsyncDynamiteSampler.connect(args.address) as device:
-        dut_info = check_provisioning(device, args.board)
+        dut_info = check_provisioning(device)
         nominals = dut_info.nominals
         prior = prior_readings(device)
 
@@ -465,11 +455,6 @@ def main() -> None:
     parser.add_argument(
         "--address",
         help="BLE address of the DUT (default: auto-detect, only one may be in range)",
-    )
-    parser.add_argument(
-        "--board",
-        choices=sorted(BOARD_MODELS),
-        help="board model (default: read from the provisioned Factory namespace)",
     )
     parser.add_argument(
         "--cal-port",
