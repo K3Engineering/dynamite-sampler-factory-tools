@@ -28,14 +28,15 @@ _PROBE_VIDS = {
     0x0403,  # FTDI
 }
 
-# Ensures the `board` global exists even if main.py didn't run (e.g. after a
-# manual soft reboot or a crashed session).
+# Ensures `board` and `therm` exist even if main.py didn't run (e.g. after a
+# manual soft reboot or a crashed session). Re-running main.py surfaces the
+# real fault (e.g. a dead TMP118) instead of a later NameError.
 _BOOTSTRAP = """
 try:
-    board
+    board, therm
 except NameError:
-    from calboard import CalibrationBoard
-    board = CalibrationBoard()
+    import main
+    board, therm = main.board, main.therm
 """
 
 
@@ -74,15 +75,18 @@ class CalBoard:
                 transport.exec(_BOOTSTRAP)
                 fw_id = transport.eval("getattr(board, 'FW_ID', 'unknown')")
                 return cls(transport, candidate, str(fw_id))
-            except Exception as e:  # not our board / not a REPL: keep looking
-                errors.append(f"  {candidate}: {e}")
+            except Exception as e:  # not our board / not a REPL / broken on boot
+                reason = str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)
+                errors.append(f"  {candidate}: {reason}")
                 if transport is not None:
                     try:
                         transport.close()
                     except Exception:
                         pass
         raise CalBoardError(
-            "no calibration board found on any serial port:\n" + "\n".join(errors)
+            "no usable calibration board on any serial port "
+            "(a board whose boot fails, e.g. a dead TMP118, reports its own "
+            "error here):\n" + "\n".join(errors)
         )
 
     def _exec(self, code: str) -> str:
