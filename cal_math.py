@@ -58,6 +58,94 @@ SWEEP_SEQUENCE_MV = (0, 5, 10, 5, 0, -5, -10, -5, 0)
 # exists (see docs/flash-schema-v2.md).
 PROVENANCE_NOMINAL = "nominal"
 
+# -- noise budget -------------------------------------------------------------
+#
+# The window-std gate is in ADC counts, and a count means very different
+# voltages on different board families: a v700P has afe_gain 101 and 4.53 V of
+# excitation (one count = 1.4 nV, span ~12.7 M counts), a v700L has afe_gain
+# 1.0 and 2.8 V with the ADC's own PGA at 32 (one count = 4.5 nV, span
+# ~2.5 M counts). The ADS131M04's own noise at 1 ksps/OSR 4096 is 23.6 counts
+# at PGA 1 and 172 counts at PGA 32, so a single absolute ceiling is either
+# 6x the Pro's noise floor or *below* the Lite's silicon floor.
+#
+# So: a reference window-std median per channel (a measured fact about a
+# known-good board), a policy factor (how much worse we ship), and a
+# within-run tail ratio (max window vs that channel's own median window, which
+# catches a disturbed measurement without fighting the level gate).
+#
+# The per-window std is itself noisy (~2.2% estimation floor at n=1000, plus
+# real drift), and on a burst-dominated channel it is worse: ch3 of the Lite
+# shows ~40 RFI bursts per window, so its std carries the Poisson scatter of
+# the event count (~16%). That is why the level gate uses the median of the
+# driven windows rather than the max, and the tail gate compares the max to
+# the same run's median instead of to an absolute number.
+NOISE_MEDIANS = {
+    # Driven-channel window std medians on known-good boards, counts
+    # (1 s windows, 1 ksps). Provisional: one board each so far.
+    "pro": (51.0, 53.0, 53.0, 54.0),  # v700P: 4.0-4.3 ppm of span
+    "lite": (194.0, 197.0, 212.0, 1542.0),  # v700L: 77/78/84 ppm; ch3 self-RFI
+}
+
+NOISE_FACTORS = {
+    "pro": (3.0, 3.0, 3.0, 3.0),
+    # ch3 is the accepted V7L self-RFI defect: it must ship. TODO verify: the
+    # ceiling is compared to the run median, so the cited max (2177 counts on
+    # 2026-10-22) does not justify 2.3 — as a max it is 1.41x reference; as a
+    # median it would clear a much tighter factor. It might be a median-to-
+    # median spread across runs that 2.3 actually covers.
+    "lite": (3.0, 3.0, 3.0, 2.3),
+}
+
+NOISE_TAIL_RATIOS = {
+    "pro": (1.6, 1.6, 1.6, 1.6),
+    # ch3's std estimate is burst-count noisy; a 2.6 gate on max/median gives
+    # ~0 false failures on the measured spread (p99.9 of max/median is 2.1).
+    "lite": (1.6, 1.6, 1.6, 2.6),
+}
+
+# board_model -> noise group. Anything unlisted assumes the lite row (the
+# conservative choice for pre-V7 boards, whose noise was never characterized).
+NOISE_GROUPS = {"v700P": "pro", "v600L": "lite", "v700L": "lite"}
+DEFAULT_NOISE_GROUP = "lite"
+
+
+def noise_group_for(board_model):
+    """The noise-budget group a board model belongs to (lazy default: lite)."""
+    return NOISE_GROUPS.get(board_model, DEFAULT_NOISE_GROUP)
+
+
+@dataclass(frozen=True)
+class NoiseSpec:
+    """Per-channel noise budget: ceiling = medians[ch] * factors[ch], and a
+    within-run max/median tail ratio."""
+
+    medians: tuple
+    factors: tuple
+    tail_ratios: tuple
+    group: str = "override"
+
+    def ceiling(self, dut_ch):
+        return self.medians[dut_ch] * self.factors[dut_ch]
+
+    def tail_ratio(self, dut_ch):
+        return self.tail_ratios[dut_ch]
+
+    @classmethod
+    def uniform(cls, counts, group="override"):
+        """One flat ceiling for every channel (bring-up escape hatch).
+
+        The tail gate is disabled: with no per-channel reference there is
+        nothing to compare a run's own median against except itself."""
+        return cls((float(counts),) * 4, (1.0,) * 4, (float("inf"),) * 4, group)
+
+    @classmethod
+    def for_group(cls, group):
+        if group not in NOISE_MEDIANS:
+            raise ValueError(f"unknown noise group {group!r}")
+        return cls(
+            NOISE_MEDIANS[group], NOISE_FACTORS[group], NOISE_TAIL_RATIOS[group], group
+        )
+
 
 def expected_span_counts(
     adc_fsr_v, afe_gain, pga_gain, exc_v, resistors=NOMINAL_LADDER_RESISTORS
@@ -135,12 +223,19 @@ class GateParams:
 
     min_window_samples: int = 100  # window must hold at least this many samples
     max_missing: int = 0  # dropped samples tolerated inside a window
-    max_std_counts: float = 100.0  # per-window noise ceiling (driven channels)
+    # Per-channel noise budget. Default is the "lite" group, the conservative
+    # choice for a board whose noise was never characterized; the driver
+    # always passes the board's own group (or a uniform override).
+    noise: NoiseSpec = None  # type: ignore[assignment]
     min_gap_counts: float = 1000.0  # monotonic spacing between config means
     pass_tol_counts: float = 200.0  # |pass1 - pass2| on the interior points
     zero_tol_counts: float = 200.0  # spread of the three zero visits
     span_tol: float = 0.10  # |measured/expected - 1| on the +/-FS span
     max_temp_spread_c: float = 0.2  # cal board temp drift over the run
+
+    def __post_init__(self):
+        if self.noise is None:
+            self.noise = NoiseSpec.for_group(DEFAULT_NOISE_GROUP)
 
 
 @dataclass
@@ -166,6 +261,82 @@ class GateReport:
         return [f.message for f in self.failures]
 
 
+def window_stats(segments, dut_ch):
+    """That channel's driven windows as [(segment, std)], in run order.
+
+    Only windows where the channel was actually driven are noise evidence; an
+    undriven channel can be wild (a Lite channel on an open input reads ~6.8k
+    counts of mains pickup) and says nothing about its own noise floor."""
+    cal_ch = dut_ch + 1
+    return [
+        (seg, seg.stds[dut_ch])
+        for seg in segments
+        if cal_ch in seg.cal_channels and seg.stds[dut_ch] is not None
+    ]
+
+
+def noise_stds(segments, dut_ch):
+    """That channel's driven-window stds, in run order (see window_stats)."""
+    return [std for _, std in window_stats(segments, dut_ch)]
+
+
+def median_noise(segments, dut_ch):
+    """The channel's reference measurement: median std of its driven windows."""
+    stds = noise_stds(segments, dut_ch)
+    return statistics.median(stds) if stds else None
+
+
+def sem_counts(std, n):
+    """Standard error of the window mean: what the noise costs the stored
+    reading. Assumes independent samples — true for thermal noise, optimistic
+    for a burst-dominated channel (ch3's ~40 events per window make its honest
+    SEM ~5x larger). Printed, never gated."""
+    return None if not n else std / (n**0.5)
+
+
+def _noise_failures(segments, dut_ch, label_for, params):
+    """Level + tail gates for one driven channel.
+
+    Level: the median window std over the driven windows vs the channel's
+    budget (reference median x factor). The median is ~3x steadier run to run
+    than a single window, so this gate is the tight one.
+    Tail: the worst window vs that same median, within this run. Catches a
+    single disturbed window, which the level gate is blind to by design.
+    """
+    stats = window_stats(segments, dut_ch)
+    if not stats:
+        return []
+    stds = [std for _, std in stats]
+    med = statistics.median(stds)
+    worst_seg, worst = max(stats, key=lambda pair: pair[1])
+    ceiling = params.noise.ceiling(dut_ch)
+    out = []
+    if med > ceiling:
+        out.append(
+            GateFailure(
+                "window-std",
+                f"dut ch{dut_ch}: median window std {med:.1f} counts "
+                f"vs {ceiling:.0f} ceiling "
+                f"({med / params.noise.medians[dut_ch]:.1f}x reference, "
+                f"{len(stds)} windows)",
+                (dut_ch,),
+            )
+        )
+    ratio = params.noise.tail_ratio(dut_ch)
+    if med > 0 and worst > ratio * med:
+        out.append(
+            GateFailure(
+                "window-tail",
+                f"{label_for(worst_seg)}: dut ch{dut_ch} "
+                f"(cal ch{dut_ch + 1}) window std {worst:.1f} counts is "
+                f"{worst / med:.1f}x this run's median {med:.0f} "
+                f"(> {ratio:.1f}x) — one disturbed window",
+                (dut_ch,),
+            )
+        )
+    return out
+
+
 def gate_run(segments, config_values, expected_span_by_ch, params):
     """Run all quality gates. Returns a GateReport (empty failures = pass)."""
     failures = []
@@ -189,17 +360,12 @@ def gate_run(segments, config_values, expected_span_by_ch, params):
                     seg_chs,
                 )
             )
-        for cal_ch in seg.cal_channels:
-            std = seg.stds[cal_ch - 1]
-            if std is not None and std > params.max_std_counts:
-                failures.append(
-                    GateFailure(
-                        "window-std",
-                        f"{label}: dut ch{cal_ch - 1} (cal ch{cal_ch}) "
-                        f"window std {std:.1f} counts",
-                        (cal_ch - 1,),
-                    )
-                )
+
+    def label_for(seg):
+        return f"phase {seg.phase} seq {seg.seq_idx} ({seg.commanded_mv:+d} mV)"
+
+    for dut_ch in range(4):
+        failures.extend(_noise_failures(segments, dut_ch, label_for, params))
 
     temps = [seg.temp_c for seg in segments]
     spread = max(temps) - min(temps)
@@ -293,7 +459,9 @@ def summarize_failures(segments, config_values, expected_span_by_ch, params, fai
 
     Each channel gets an OK or a named signature (gross/marginal) with the key numbers on indented
     sub-lines. A total response across the sweep below the gap floor means the stimulus never
-    reached the ADC.
+    reached the ADC. A passing channel still reports its noise line: the numbers are the
+    evidence the budget was met, and the only record of how the accepted ch3 defect
+    actually measured on this unit.
     """
     lines = []
     for dut_ch in range(4):
@@ -306,13 +474,39 @@ def summarize_failures(segments, config_values, expected_span_by_ch, params, fai
     return lines
 
 
+def _noise_line(dut_ch, segments, params):
+    """One channel's noise measurement in counts, with its SEM.
+
+    SEM is what the noise costs the stored reading (the gate stores window
+    means, not samples). TODO verify: ppm of span may belong in the line as
+    well, putting boards with different gain chains on one scale, since a
+    count is 5.1x more span on a Lite (0.078 ppm on a Pro against 0.400) —
+    not the 19x that the measured noise medians (78 against 4.0 ppm) suggest.
+    """
+    stats = window_stats(segments, dut_ch)
+    if not stats:
+        return None
+    med = statistics.median(std for _, std in stats)
+    ns = [seg.n_samples for seg, _ in stats]
+    sem = sem_counts(med, int(statistics.median(ns)))
+    ceiling = params.noise.ceiling(dut_ch)
+    ref = params.noise.medians[dut_ch]
+    extra = f", SEM {sem:.0f}" if sem is not None else ""
+    return (
+        f"     noise: median std {med:.0f} counts ({med / ref:.1f}x "
+        f"{params.noise.group} reference {ref:.0f}, ceiling {ceiling:.0f}, "
+        f"worst {max(std for _, std in stats):.0f}{extra}; {len(stats)} windows)"
+    )
+
+
 def _channel_verdict(
     dut_ch, segments, config_values, expected_span_by_ch, params, failures
 ):
     """One channel's headline verdict plus indented explanation sub-lines."""
     ch_failures = [f for f in failures if dut_ch in f.channels]
     if not ch_failures:
-        return [f"ch{dut_ch}: OK"]
+        line = _noise_line(dut_ch, segments, params)
+        return [f"ch{dut_ch}: OK"] + ([line] if line else [])
     kinds = {f.kind for f in ch_failures}
     cal_ch = dut_ch + 1
     driven = [seg for seg in segments if cal_ch in seg.cal_channels]
@@ -354,20 +548,25 @@ def _channel_verdict(
         return [f"ch{dut_ch}: SPAN OFF (gross)", *sub]
 
     if "window-std" in kinds:
-        stds = [seg.stds[dut_ch] for seg in driven if seg.stds[dut_ch] is not None]
-        over = sum(s > params.max_std_counts for s in stds)
-        # "marginal": within 2x of the (gross-fault) ceiling — likely a real
-        # noise floor sitting at the threshold, not a broken channel.
-        tag = "marginal" if max(stds) <= 2 * params.max_std_counts else "gross"
-        sub = [
-            f"     window std {min(stds):.0f}-{max(stds):.0f} counts vs "
-            f"{params.max_std_counts:.0f} ceiling; over in {over} of "
-            f"{len(stds)} windows ({where})"
-        ]
+        med = median_noise(segments, dut_ch)
+        # "marginal": the median sits within 2x the ceiling — likely a real
+        # noise floor at the threshold, not a broken channel.
+        tag = "marginal" if med <= 2 * params.noise.ceiling(dut_ch) else "gross"
+        sub = [_noise_line(dut_ch, segments, params), f"     driven by {where}"]
         extra = kinds - {"window-std"}
         if extra:
             sub.append(f"     also: {', '.join(sorted(extra))} — see detail")
         return [f"ch{dut_ch}: NOISY ({tag})", *sub]
+
+    if "window-tail" in kinds:
+        # The level gate passed: this run's median is within budget, but one
+        # window was disturbed. Worth a rerun, not a hardware verdict.
+        failure = next(f for f in ch_failures if f.kind == "window-tail")
+        return [
+            f"ch{dut_ch}: WINDOW DISTURBED (retry)",
+            f"     {failure.message}",
+            _noise_line(dut_ch, segments, params),
+        ]
 
     return [f"ch{dut_ch}: FAILED ({', '.join(sorted(kinds))}) — see detail"]
 
@@ -389,6 +588,8 @@ def build_flash_entries(
     adc_gains,
     temp_dut_c,
     temp_calboard_c,
+    noise_stds=None,
+    tx_power_dbm=None,
 ):
     """Factory-namespace entries for a passed calibration.
 
@@ -398,6 +599,12 @@ def build_flash_entries(
     temp_dut_c/temp_calboard_c: temperatures at calibration (cal.temp,
     "dut,calboard"); temp_dut_c is a placeholder until the DUT sensor is
     plumbed.
+    noise_stds: {dut_ch: median window std in counts} -> chN.noise, so the
+    accepted-defect channels are auditable on the board itself and the noise
+    reference medians can be re-derived from the shipped fleet.
+    tx_power_dbm: BLE TX power during calibration -> cal.txpwr, because it is
+    a measurement condition that moves a self-RFI channel's noise (ch3 on the
+    Lite measured 240 counts at 0 dBm and 185 at -12).
     Keys/values are KVS strings; the key/value length limits are enforced by
     the device's KVS namespace writes, not here.
     """
@@ -406,6 +613,8 @@ def build_flash_entries(
     for dut_ch in range(4):
         entries[f"ch{dut_ch}.r"] = ",".join(_fmt(v) for v in resistors)
         entries[f"ch{dut_ch}.raw"] = ",".join(_fmt(v) for v in readings[dut_ch])
+        if noise_stds and dut_ch in noise_stds:
+            entries[f"ch{dut_ch}.noise"] = _fmt(noise_stds[dut_ch])
     entries["cal.date"] = now.isoformat(timespec="seconds")
     entries["cal.board"] = cal_board_id
     entries["cal.r.prov"] = r_provenance
@@ -413,4 +622,6 @@ def build_flash_entries(
     entries["cal.tool"] = tool
     entries["cal.origin"] = origin
     entries["cal.adc"] = ",".join(_fmt(g) for g in adc_gains)
+    if tx_power_dbm is not None:
+        entries["cal.txpwr"] = _fmt(tx_power_dbm)
     return entries

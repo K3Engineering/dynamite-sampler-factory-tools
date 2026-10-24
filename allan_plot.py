@@ -92,7 +92,12 @@ class StdoutTee:
         self._file = open(path, "w", encoding="utf-8")
 
     def write(self, s):
-        self.stream.write(s)
+        try:
+            self.stream.write(s)
+        except UnicodeEncodeError:
+            # A Windows console may be cp1252 while the report is utf-8.
+            enc = getattr(self.stream, "encoding", None) or "ascii"
+            self.stream.write(s.encode(enc, "replace").decode(enc, "replace"))
         if not s.startswith("\r"):
             self._file.write(s)
 
@@ -398,13 +403,14 @@ async def run(args: argparse.Namespace) -> int:
 
     async with await AsyncDynamiteSampler.connect(args.address) as device:
         info = check_provisioning(device)
-        if args.tx_power is not None:
+        if args.no_set_tx_power:
+            tx_power_dbm = await device.read_tx_power_dbm()
+        else:
             print(f"Setting TX power to {args.tx_power} dBm")
-            await device.set_tx_power(args.tx_power)
-        # Always recorded — it's a measurement condition. Read back after the
-        # write too: the firmware only logs a failed setPower, nothing comes
-        # back over BLE; set_tx_power() already verified the read-back.
-        tx_power_dbm = await device.read_tx_power_dbm()
+            # set_tx_power verifies its own read-back; the firmware only logs a
+            # failed setPower and sends nothing back over BLE.
+            tx_power_dbm = await device.set_tx_power(args.tx_power)
+        # Always recorded: it is a measurement condition.
         rate = device.sample_rate
         volts_per_count_ch = [
             allan_math.volts_per_count(
@@ -562,10 +568,17 @@ def main() -> None:
     parser.add_argument(
         "--tx-power",
         type=int,
-        choices=[-12, -9, -6, -3, 0, 3, 6, 9],
+        choices=[-24, -21, -18, -15, -12, -9, -6, -3, 0, 3, 6, 9],
         metavar="DBM",
+        default=-12,
         help="set the DUT's BLE TX power for the capture; persists on the "
-        "device until reboot (default: leave as-is)",
+        "device until reboot. Low power shrinks self-RFI coupling into the "
+        "analog front end (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no-set-tx-power",
+        action="store_true",
+        help="leave the DUT's TX power as-is (it is still recorded)",
     )
     parser.add_argument(
         "--duration",

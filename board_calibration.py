@@ -10,10 +10,17 @@ Flow:
      driven simultaneously).
   4. Segment the capture per commanded state (guard + dwell around SSN
      windows), compute the five per-config means per channel, run the gates.
-  5. On pass: write ch{i}.r / ch{i}.raw / cal.* as one batch to the chosen
-     namespace (read-back verified, one calibration rebuild) and log
-     everything to the factory DB.
+     The noise gates are per board model and per channel (see
+     cal_math.NOISE_MEDIANS): the same window std means very different things
+     on a v700P (afe_gain 101) and a v700L (afe_gain 1, ADC PGA 32).
+  5. On pass: write ch{i}.r / ch{i}.raw / ch{i}.noise / cal.* as one batch to
+     the chosen namespace (read-back verified, one calibration rebuild) and
+     log everything to the factory DB.
      On any gate failure: abort loudly, write nothing (DB + CSV remain).
+
+The DUT's BLE TX power is pinned for the sweep (--tx-power-dbm, default
+-12 dBm) and recorded: a self-RFI channel's noise floor scales with it, so an
+unpinned run is not comparable with any other.
 
 The Factory namespace holds the as-built calibration and is write-once over
 BLE, so a failed group write there can leave a torn group behind — recovery
@@ -27,6 +34,7 @@ Usage:
     python board_calibration.py [--address AA:BB:CC:DD:EE:FF] [--cal-port COM5]
                                 [--namespace factory|user] [--origin TAG]
                                 [--dwell 1.0] [--guard 0.4] [--dry-run]
+                                [--tx-power-dbm -12]
 """
 
 import argparse
@@ -54,11 +62,20 @@ import db
 from calboard_driver import CalBoard, CalBoardError
 from nominal_values import BOARD_MODELS
 
-SCRIPT_VERSION = "board_calibration 2.1"
+SCRIPT_VERSION = "board_calibration 2.2"
 
 # TODO: read the DUT's onboard temperature sensor and plumb it through
 # (cal.temp dut field, segments table). Placeholder until then.
 DUT_TEMP_PLACEHOLDER_C = -999.0
+
+# BLE TX power during the sweep. A self-RFI channel's noise scales with it:
+# the Lite's ch3 measured 240 counts of window std at 0 dBm and 185 at -12
+# (isolated, on load cells). Calibrating at a pinned, low power makes the
+# stored readings reproducible and keeps the noise gates meaningful; the value
+# is recorded in cal.txpwr and the DB because it is a measurement condition.
+DEFAULT_TX_POWER_DBM = -12
+# The firmware's TX_POWER_STEPS, minus the positive end (no reason to shout).
+TX_POWER_CHOICES = (-24, -21, -18, -15, -12, -9, -6, -3, 0)
 
 # Namespace the cal group is written to. User holds a recalibration that
 # overrides the factory group; see docs/flash-schema-v2.md.
@@ -288,21 +305,40 @@ async def write_entries(device, entries: dict[str, str], namespace: str) -> None
 
 
 async def run(args: argparse.Namespace) -> int:
-    gate_params = cal_math.GateParams(
-        min_window_samples=args.min_window_samples,
-        max_missing=args.max_missing,
-        max_std_counts=args.max_std_counts,
-        min_gap_counts=args.min_gap_counts,
-        pass_tol_counts=args.pass_tol_counts,
-        zero_tol_counts=args.zero_tol_counts,
-        span_tol=args.span_tol,
-        max_temp_spread_c=args.max_temp_spread_c,
-    )
-
     async with await AsyncDynamiteSampler.connect(args.address) as device:
         dut_info = check_provisioning(device)
         nominals = dut_info.nominals
         prior = prior_readings(device)
+        noise_group = cal_math.noise_group_for(dut_info.board_model)
+
+        # Pin the TX power before anything is measured: on a self-RFI channel
+        # the noise floor scales with it, so an unpinned run is not comparable
+        # with any other.
+        tx_power_dbm = await device.read_tx_power_dbm()
+        if not args.no_set_tx_power:
+            tx_power_dbm = await device.set_tx_power(args.tx_power_dbm)
+        print(
+            f"DUT {dut_info.board_model} on {device.info.address}: "
+            f"noise group '{noise_group}', TX {tx_power_dbm} dBm"
+        )
+
+        gate_params = cal_math.GateParams(
+            min_window_samples=args.min_window_samples,
+            max_missing=args.max_missing,
+            noise=cal_math.NoiseSpec.uniform(args.max_std_counts)
+            if args.max_std_counts is not None
+            else cal_math.NoiseSpec.for_group(noise_group),
+            min_gap_counts=args.min_gap_counts,
+            pass_tol_counts=args.pass_tol_counts,
+            zero_tol_counts=args.zero_tol_counts,
+            span_tol=args.span_tol,
+            max_temp_spread_c=args.max_temp_spread_c,
+        )
+        if args.max_std_counts is not None:
+            print(
+                f"noise budget overridden: flat {args.max_std_counts:g} counts "
+                "on every channel (tail gate disabled)"
+            )
 
         cal = await asyncio.to_thread(CalBoard.connect, args.cal_port)
         cal_uid = f"{await asyncio.to_thread(cal.unique_id):012X}"
@@ -341,6 +377,8 @@ async def run(args: argparse.Namespace) -> int:
                 "dwell_s": args.dwell,
                 "guard_s": args.guard,
                 "namespace": args.namespace,
+                "tx_power_dbm": tx_power_dbm,
+                "noise_group": gate_params.noise.group,
                 "script": SCRIPT_VERSION,
             },
         )
@@ -393,6 +431,11 @@ async def run(args: argparse.Namespace) -> int:
             readings = cal_math.final_readings(config_values)
             delta = readings_delta(readings, prior)
             temp_calboard_mean = statistics.fmean(seg.temp_c for seg in segments)
+            noise_stds = {
+                dut_ch: value
+                for dut_ch in range(4)
+                if (value := cal_math.median_noise(segments, dut_ch)) is not None
+            }
             entries = cal_math.build_flash_entries(
                 readings,
                 cal.fw_id,
@@ -402,6 +445,8 @@ async def run(args: argparse.Namespace) -> int:
                 adc_gains=dut_info.pga_gains,
                 temp_dut_c=DUT_TEMP_PLACEHOLDER_C,
                 temp_calboard_c=temp_calboard_mean,
+                noise_stds=noise_stds,
+                tx_power_dbm=tx_power_dbm,
             )
             print("Gates passed. Calibration readings (raw counts, storage order):")
             for dut_ch in range(4):
@@ -498,6 +543,20 @@ def main() -> None:
         help="settling guard after each relay command, seconds (default: %(default)s)",
     )
     parser.add_argument(
+        "--tx-power-dbm",
+        type=int,
+        choices=TX_POWER_CHOICES,
+        default=DEFAULT_TX_POWER_DBM,
+        help="DUT BLE TX power during the sweep, dBm (default: %(default)s). "
+        "A self-RFI channel's noise scales with TX power, so a pinned low "
+        "value makes runs comparable; recorded in cal.txpwr",
+    )
+    parser.add_argument(
+        "--no-set-tx-power",
+        action="store_true",
+        help="leave the DUT's TX power as-is (it is still recorded)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="measure and gate, but write nothing to the device",
@@ -505,7 +564,13 @@ def main() -> None:
     gates = parser.add_argument_group("gate thresholds (gross-fault defaults)")
     gates.add_argument("--min-window-samples", type=int, default=100)
     gates.add_argument("--max-missing", type=int, default=0)
-    gates.add_argument("--max-std-counts", type=float, default=150.0)
+    gates.add_argument(
+        "--max-std-counts",
+        type=float,
+        default=None,
+        help="override the per-channel noise budget with one flat ceiling, "
+        "counts (default: the board model's per-channel budget)",
+    )
     gates.add_argument("--min-gap-counts", type=float, default=1000.0)
     gates.add_argument("--pass-tol-counts", type=float, default=200.0)
     gates.add_argument("--zero-tol-counts", type=float, default=200.0)

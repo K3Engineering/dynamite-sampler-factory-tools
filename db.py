@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS runs (
     dwell_s REAL,
     guard_s REAL,
     namespace TEXT NOT NULL,  -- factory/user (cal group target)
+    tx_power_dbm INTEGER,     -- DUT BLE TX power during the sweep (measurement condition)
+    noise_group TEXT,         -- noise budget row used by the gates (pro/lite/override)
     result TEXT NOT NULL DEFAULT 'running',  -- running/pass/fail/dry-run/aborted
     fail_reason TEXT,
     script TEXT NOT NULL
@@ -69,13 +71,25 @@ CREATE TABLE IF NOT EXISTS calibrations (
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
-    """Open the factory log, creating the schema as needed."""
+    """Open the factory log, creating the schema as needed.
+
+    New columns are added to an existing log in place (the runs from before a
+    column existed keep NULL for it), so a factory log written by an older
+    tool keeps working after an upgrade."""
     con = sqlite3.connect(db_path)
     con.execute(_SCHEMA_RUNS)
     con.execute(_SCHEMA_SEGMENTS)
     con.execute(_SCHEMA_CALIBRATIONS)
+    _add_missing_columns(con, "runs", {"tx_power_dbm": "INTEGER", "noise_group": "TEXT"})
     con.commit()
     return con
+
+
+def _add_missing_columns(con, table, columns):
+    have = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+    for name, decl in columns.items():
+        if name not in have:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def insert_run(con: sqlite3.Connection, record: dict) -> int:
@@ -84,8 +98,8 @@ def insert_run(con: sqlite3.Connection, record: dict) -> int:
         "INSERT INTO runs"
         " (ts_utc, device_address, device_name, board_model, firmware_rev,"
         "  cal_board_id, cal_board_uid, cal_port,"
-        "  csv_path, dwell_s, guard_s, namespace, script)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "  csv_path, dwell_s, guard_s, namespace, tx_power_dbm, noise_group, script)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             record["ts_utc"],
             record["device_address"],
@@ -99,6 +113,8 @@ def insert_run(con: sqlite3.Connection, record: dict) -> int:
             record.get("dwell_s"),
             record.get("guard_s"),
             record["namespace"],
+            record.get("tx_power_dbm"),
+            record.get("noise_group"),
             record["script"],
         ),
     )
