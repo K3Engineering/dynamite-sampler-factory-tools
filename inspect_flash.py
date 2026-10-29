@@ -24,11 +24,8 @@ from kvs_api_shim import (
 
 
 async def dump_namespace(device, folder) -> dict[str, str]:
-    """All key/value pairs in a namespace. String entries come from the
-    snapshot; anything the firmware never writes is flagged."""
-    values = device.kvs.snapshot.get(folder, {})
-    keys = await namespace(device, folder).keys()
-    return {key: values.get(key, "<not a string entry>") for key in keys}
+    """All string key/value pairs in a namespace, read from the device."""
+    return await namespace(device, folder).read_all()
 
 
 def print_pretty(

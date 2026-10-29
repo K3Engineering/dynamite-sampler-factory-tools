@@ -46,8 +46,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
-
 from kvs_api_shim import (
     KVS_WRITE_DELAY_S,
     AsyncDynamiteSampler,
@@ -90,10 +88,6 @@ CAL_GROUP_MARKER = "cal.date"
 DEFAULT_DB_PATH = Path(__file__).resolve().with_name("factory_log.db")
 DEFAULT_CAPTURE_DIR = Path(__file__).resolve().with_name("captures")
 
-# Feed blocks are the SSN-window granularity: 10 rows = 10 ms at 1 ksps,
-# which keeps the guard/dwell boundaries tight relative to the sweep.
-FEED_BLOCK_ROWS = 10
-
 # Sweep phases in cal-board channels: one channel per bridge at a time.
 # DUT channel index = cal channel - 1 (fixture wiring).
 PHASES = ((1, 3), (2, 4))
@@ -102,8 +96,10 @@ PHASES = ((1, 3), (2, 4))
 class FeedRecorder:
     """A dynamite-csv capture plus the received rows, for SSN-window slicing."""
 
-    def __init__(self, device, file_path):
-        self._recorder = CsvRecorder(device, file_path, units="raw")
+    def __init__(self, device, calibration, file_path):
+        self._recorder = CsvRecorder(
+            device, file_path, units="raw", calibration=calibration
+        )
         self._rows = []
         self._last_ssn = None
 
@@ -116,13 +112,14 @@ class FeedRecorder:
     def rows(self):
         return self._rows
 
-    def add_block(self, block):
-        self._recorder.write(block)
-        self._last_ssn = block.ssn0 + len(block) - 1
+    def add_packet(self, packet):
+        self._recorder.write(packet)
+        self._last_ssn = packet.ssn + packet.rows_dropped + packet.rows - 1
         t_ms = round(time.time() * 1000)
-        for i, row in enumerate(block.raw):
-            if not np.isnan(row).any():
-                self._rows.append((block.ssn0 + int(i), t_ms, *(int(v) for v in row)))
+        for i, row in enumerate(packet.raw):
+            self._rows.append(
+                (packet.ssn + packet.rows_dropped + i, t_ms, *(int(v) for v in row))
+            )
 
     def window(self, ssn_start, ssn_end):
         """Received rows with ssn_start <= ssn <= ssn_end."""
@@ -132,9 +129,9 @@ class FeedRecorder:
         self._recorder.close()
 
 
-def read_flash_nominals(device) -> dict[str, float]:
-    """The provisioned analog nominals (parsed at connect; this renames)."""
-    nominals = device.calibration.nominals
+def read_flash_nominals(calibration) -> dict[str, float]:
+    """The provisioned analog nominals (renamed from the parsed calibration)."""
+    nominals = calibration.nominals
     if nominals is None:
         raise KvsError(
             "board constants not provisioned — run flash_factory_nominals.py first"
@@ -156,7 +153,7 @@ class DutInfo:
     nominals: dict[str, float]
 
 
-def check_provisioning(device) -> DutInfo:
+def check_provisioning(device, calibration) -> DutInfo:
     """Read the identity the firmware booted with + the analog nominals.
 
     The identity is the DIS Hardware Revision, which the firmware derives from
@@ -173,7 +170,7 @@ def check_provisioning(device) -> DutInfo:
         device.info.firmware,
         device.gains,
         board_model,
-        read_flash_nominals(device),
+        read_flash_nominals(calibration),
     )
 
 
@@ -249,11 +246,11 @@ def reduce_segments(
     return segments
 
 
-def prior_readings(device) -> dict[int, list[float]] | None:
+def prior_readings(calibration) -> dict[int, list[float]] | None:
     """The effective calibration's per-channel readings before this run, or
     None when the board had none. User overrides Factory, as in every other
     reader."""
-    group = device.calibration.group
+    group = calibration.group
     if group is None:
         return None
     return {
@@ -306,9 +303,10 @@ async def write_entries(device, entries: dict[str, str], namespace: str) -> None
 
 async def run(args: argparse.Namespace) -> int:
     async with await AsyncDynamiteSampler.connect(args.address) as device:
-        dut_info = check_provisioning(device)
+        calibration = await device.read_calibration()
+        dut_info = check_provisioning(device, calibration)
         nominals = dut_info.nominals
-        prior = prior_readings(device)
+        prior = prior_readings(calibration)
         noise_group = cal_math.noise_group_for(dut_info.board_model)
 
         # Pin the TX power before anything is measured: on a self-RFI channel
@@ -384,8 +382,8 @@ async def run(args: argparse.Namespace) -> int:
         )
         print(f"Run #{run_id}: capture -> {csv_path}")
 
-        recorder = FeedRecorder(device, csv_path)
-        pump = FeedPump(device, recorder, blocksize=FEED_BLOCK_ROWS)
+        recorder = FeedRecorder(device, calibration, csv_path)
+        pump = FeedPump(device, recorder)
         try:
             deadline = time.monotonic() + 10.0
             while recorder.last_ssn is None:

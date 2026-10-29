@@ -10,20 +10,21 @@ import asyncio
 
 
 class FeedPump:
-    """Pumps a raw device stream into a recorder in a background task, so the
-    caller can operate a stimulus (relay sweep, timed capture) meanwhile.
+    """Pumps the raw device packet feed into a recorder in a background task,
+    so the caller can operate a stimulus (relay sweep, timed capture)
+    meanwhile.
 
     A pump failure (``ConnectionLost``, ``BufferOverrun``) is re-raised by
     :meth:`check` from the control loop and by :meth:`stop`; a run must not
     finish with a dead pump."""
 
-    def __init__(self, device, recorder, blocksize=100):
-        self._task = asyncio.ensure_future(self._run(device, recorder, blocksize))
+    def __init__(self, device, recorder):
+        self._task = asyncio.ensure_future(self._run(device, recorder))
 
     @staticmethod
-    async def _run(device, recorder, blocksize):
-        async for block in device.stream(blocksize=blocksize, units="raw"):
-            recorder.add_block(block)
+    async def _run(device, recorder):
+        async for packet in device.stream():
+            recorder.add_packet(packet)
 
     def check(self):
         """Re-raise a pump failure, if any."""

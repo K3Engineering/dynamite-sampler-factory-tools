@@ -123,8 +123,10 @@ class AllanRecorder:
     file they are blank rows.
     """
 
-    def __init__(self, device, file_path, keep_channels, capacity):
-        self._recorder = CsvRecorder(device, file_path, units="raw")
+    def __init__(self, device, calibration, file_path, keep_channels, capacity):
+        self._recorder = CsvRecorder(
+            device, file_path, units="raw", calibration=calibration
+        )
         self._keep = tuple(keep_channels)
         self._buf = {ch: np.empty(capacity, dtype=np.int32) for ch in self._keep}
         self._capacity = capacity
@@ -140,13 +142,12 @@ class AllanRecorder:
     def missing_count(self):
         return self._missing
 
-    def add_block(self, block):
-        self._recorder.write(block)
-        valid = ~np.isnan(block.raw).any(axis=1)
-        self._missing += int((~valid).sum())
-        values = block.raw[valid]
+    def add_packet(self, packet):
+        self._recorder.write(packet)
+        self._missing += packet.rows_dropped
+        values = packet.raw
         end = self._n + values.shape[0]
-        if end > self._capacity:
+        if end + self._missing > self._capacity:
             self.overflowed = True
             return
         for ch in self._keep:
@@ -402,7 +403,8 @@ async def run(args: argparse.Namespace) -> int:
     channel_sets, kept_channels = plan_capture(args)
 
     async with await AsyncDynamiteSampler.connect(args.address) as device:
-        info = check_provisioning(device)
+        calibration = await device.read_calibration()
+        info = check_provisioning(device, calibration)
         if args.no_set_tx_power:
             tx_power_dbm = await device.read_tx_power_dbm()
         else:
@@ -444,7 +446,7 @@ async def run(args: argparse.Namespace) -> int:
             capacity = estimate_capacity(
                 rate, args.duration, n_parts, args.guard if channel_sets else 0.0
             )
-            recorder = AllanRecorder(device, csv_path, kept_channels, capacity)
+            recorder = AllanRecorder(device, calibration, csv_path, kept_channels, capacity)
             pump = FeedPump(device, recorder)
             try:
                 deadline = time.monotonic() + 10.0
